@@ -56,6 +56,21 @@ public static class ArtifactValidator
         foreach (var card in cardList)
         {
             var bar = BarParser.Parse(card, tag);
+
+            // 总结/名册卡本身不是一根棒。它里面罗列了全部棒位，
+            // 若按普通卡片解析会被当成"0:00 那一棒"，导致后续棒号整体错位（实测 topic 1348289）。
+            if (SummaryExtractor.IsSummaryCard(card, out _))
+            {
+                bar.BarNumber = null;
+                bar.IsEx = false;
+                bar.DeclaredTime = null;
+                bar.MatchedStyle = "总结名册卡(不计为棒)";
+                bar.Conflicts.Clear();
+                bar.Notes.Clear();
+                bar.Notes.Add("本条是活动的总结/名册动态，不作为一根棒");
+                bar.IsSummary = true;
+            }
+
             BarParser.ComputeDeviation(bar);
             result.Bars.Add(bar);
         }
@@ -94,7 +109,7 @@ public static class ArtifactValidator
         // ---------- 与接口声称的动态数对照（信息性，不硬失败） ----------
         if (dynamicsReported is { } dyn && dyn > 0)
         {
-            int explained = bars.Count(b => b.BarNumber.HasValue || b.IsEx);
+            int explained = bars.Count(b => !b.IsSummary && (b.BarNumber.HasValue || b.IsEx));
             int unnumbered = bars.Count - explained;
             if (dyn != bars.Count)
                 result.Warnings.Add($"卡片数({bars.Count}) ≠ 接口声称的 dynamics({dyn})");
@@ -109,6 +124,8 @@ public static class ArtifactValidator
         // ---------- 逐条标注问题 ----------
         foreach (var b in bars)
         {
+            if (b.IsSummary) continue; // 总结/名册卡不参与逐条问题标注
+
             if (b.IsUnattributable)
                 b.Conflicts.Add(b.DeclaredTime is null
                     ? "无法归属：正文里找不到棒号（需人工保存页面兜底）"

@@ -239,8 +239,10 @@ public static class SummaryExtractor
         }
 
         // 3) 「HH:MM@名字」写法
+        //    关键守卫：匹配区间内若含换行，说明这是"总结名册"的一段（那个由 SummaryExtractor 专门处理），
+        //    否则名册卡会被当成"第1棒"，导致后续每根棒的棒号整体 +1（实测 topic 1348289 曾因此棒号全错）。
         var m = TimeAtNameRegex.Match(text);
-        if (m.Success && m.Groups["h"].Value.Length <= 2)
+        if (m.Success && m.Groups["h"].Value.Length <= 2 && !m.Value.Contains('\n'))
         {
             time ??= TextNormalizer.NormalizeTime(m.Groups["h"].Value, m.Groups["m"].Value);
             if (qualifier is null && m.Groups["q"].Success) qualifier = m.Groups["q"].Value.Trim();

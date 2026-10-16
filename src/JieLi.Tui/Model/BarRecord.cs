@@ -132,6 +132,9 @@ public sealed class ParsedBar
     /// <summary>该卡片是否带本活动的话题标签（归属判定的最强信号）。</summary>
     public bool HasTopicTag { get; set; }
 
+    /// <summary>该卡片是否为活动的总结/名册动态（不是一根棒）。</summary>
+    public bool IsSummary { get; set; }
+
     public List<string> Conflicts { get; } = new();
     public List<string> Notes { get; } = new();
 
