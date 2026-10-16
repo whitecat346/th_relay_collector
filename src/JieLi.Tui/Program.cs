@@ -24,6 +24,9 @@ public static class Program
         string? renderTarget = null;
         string? archiveTarget = null;
         bool allowUnconfirmed = false;
+        bool backfill = false;
+        bool applyBackfill = false;
+        bool fixHeader = false;
         string? outDir = null;
         bool forcePlain = false;
 
@@ -63,6 +66,15 @@ public static class Program
                     break;
                 case "--allow-unconfirmed":
                     allowUnconfirmed = true;
+                    break;
+                case "--backfill":
+                    backfill = true;
+                    break;
+                case "--apply":
+                    applyBackfill = true;
+                    break;
+                case "--fix-header":
+                    fixHeader = true;
                     break;
                 case "--out":
                     if (i + 1 < args.Length) outDir = args[++i];
@@ -117,6 +129,9 @@ public static class Program
             var workRootForRender = outDir ?? Path.Combine(root, "relay-tool", "work");
             return RunRender(root, workRootForRender, renderTarget, archiveTarget, allowUnconfirmed);
         }
+
+        if (backfill)
+            return RunBackfill(root, applyBackfill, fixHeader);
 
         var scanner = new Scanner(root);
         var activities = scanner.ScanAll();
@@ -174,6 +189,70 @@ public static class Program
             if (ex.InnerException is not null) Log("  内层：" + ex.InnerException.Message);
             return 4;
         }
+    }
+
+    // ------------------------------------------------------------- 旧归档回填（M6）
+
+    private static int RunBackfill(string root, bool apply, bool fixHeader)
+    {
+        using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        void Log(string m) => w.WriteLine(m);
+
+        var reports = ArchiveBackfill.AnalyzeAll(root);
+        Log($"扫描到 {reports.Count} 个归档 CSV");
+        Log("");
+
+        int encCount = 0, headerCount = 0, typeCount = 0, typeRows = 0;
+        foreach (var r in reports)
+        {
+            if (r.Issues.Count == 0) continue;
+            Log($"● {r.RelativePath}");
+            foreach (var issue in r.Issues)
+            {
+                Log($"    [{issue.Kind}] {issue.Detail}"
+                    + (issue.Affected > 1 ? $"（影响 {issue.Affected} 行）" : ""));
+                switch (issue.Kind)
+                {
+                    case "编码": encCount++; break;
+                    case "表头": headerCount++; break;
+                    case "类型": typeCount++; typeRows += issue.Affected; break;
+                }
+            }
+        }
+
+        Log("");
+        Log($"汇总：编码 {encCount} 个文件 / 重复表头 {headerCount} 个文件 / 类型归一化 {typeCount} 个文件（{typeRows} 行）");
+
+        if (!apply)
+        {
+            Log("");
+            Log("这是**干跑**（未修改任何文件）。要应用请加 --apply。");
+            Log($"  --apply                统一编码为 UTF-8+BOM、类型归一化（每文件先存 .bak）");
+            Log($"  --apply --fix-header   同时把重复的第 6 列「地址」改名为「作品链接」");
+            Log("    注意：改名后 legacy/csv_md.py 的列名预期与实际表头不再一致（它按列序读取，功能不受影响）。");
+            return 0;
+        }
+
+        int fixedCount = 0;
+        foreach (var r in reports.Where(x => x.Issues.Count > 0))
+        {
+            try
+            {
+                ArchiveBackfill.Apply(r, fixHeader);
+                if (r.Fixed)
+                {
+                    fixedCount++;
+                    Log($"✔ 已修复 {r.RelativePath}   备份 {Path.GetFileName(r.BackupPath)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"✘ {r.RelativePath} 修复失败：{ex.Message}");
+            }
+        }
+        Log("");
+        Log($"已修复 {fixedCount} 个文件。");
+        return 0;
     }
 
     // ------------------------------------------------------------- 渲染模式（M5）

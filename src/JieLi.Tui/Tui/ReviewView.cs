@@ -257,11 +257,11 @@ public sealed class ReviewView
             case ConsoleKey.K:
                 EditField("作品类型（插画/文章/视频/MMD/手书/COS/漫画/音乐…）",
                           string.IsNullOrWhiteSpace(cur.TypeLabel) ? BarParser.InferWorkKind(cur.Type, cur.MergedText) : cur.TypeLabel,
-                          v =>
-                          {
-                              cur.TypeLabel = string.IsNullOrWhiteSpace(v) ? null : v.Trim();
-                              return "类型已改为 " + (cur.TypeLabel ?? "（自动）");
-                          });
+                            v =>
+                            {
+                                cur.TypeLabel = string.IsNullOrWhiteSpace(v) ? string.Empty : v.Trim();
+                                return "类型已改为 " + (cur.TypeLabel.Length > 0 ? cur.TypeLabel : "（自动）");
+                            });
                 break;
         }
     }
