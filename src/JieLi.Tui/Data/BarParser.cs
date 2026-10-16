@@ -108,6 +108,7 @@ public static class BarParser
         var text = TextNormalizer.Normalize(card.MergedText ?? string.Empty);
         bar.MergedText = text;
         bar.HasTopicTag = !string.IsNullOrEmpty(topicTag) && text.Contains(topicTag, StringComparison.Ordinal);
+        bar.WorkKindLabel = InferWorkKind(card.Type, text);
         if (string.IsNullOrWhiteSpace(text))
         {
             bar.Notes.Add("卡片无正文");
@@ -257,6 +258,30 @@ public static class BarParser
         s = TextNormalizer.CleanMention(s);
         s = s.Trim('[', ']', '【', '】', '「', '」');
         return s.Trim();
+    }
+
+    /// <summary>
+    /// 把 B站 的卡片类型映射到既有 CSV 的"类型"词表（插画/视频/文章…）。
+    /// 实测既有 683 行的词表：插画 436 / 文章 78 / 视频 42 / 插图 39 / 图片 29 / 漫画 8 / MMD 5 / 音乐 4 …
+    /// 这里只能给出"形态级"的粗标签（DRAW→插画、AV→视频、ARTICLE→文章），
+    /// 更细的类型（MMD/手书/COS/音乐…）需要从标题正文或人工确认得出 —— 因此它只是草稿值。
+    /// </summary>
+    public static string InferWorkKind(string? cardType, string text)
+    {
+        var t = cardType ?? string.Empty;
+        if (t.Contains("DRAW", StringComparison.OrdinalIgnoreCase))
+        {
+            if (text.Contains("COS", StringComparison.OrdinalIgnoreCase) || text.Contains("cosplay", StringComparison.OrdinalIgnoreCase)) return "COS";
+            if (text.Contains("MMD", StringComparison.OrdinalIgnoreCase)) return "MMD";
+            if (text.Contains("手书", StringComparison.Ordinal)) return "手书";
+            if (text.Contains("漫画", StringComparison.Ordinal)) return "漫画";
+            return "插画";
+        }
+        if (t.Contains("AV", StringComparison.OrdinalIgnoreCase)) return "视频";
+        if (t.Contains("ARTICLE", StringComparison.OrdinalIgnoreCase)) return "文章";
+        if (t.Contains("FORWARD", StringComparison.OrdinalIgnoreCase)) return "转发";
+        if (t.Contains("WORD", StringComparison.OrdinalIgnoreCase)) return "动态";
+        return string.Empty;
     }
 
     /// <summary>计算"发布时刻"与"声明时段"的偏差（分钟）。</summary>

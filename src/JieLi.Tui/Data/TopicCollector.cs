@@ -209,6 +209,7 @@ public sealed class TopicCollector
                 matched_style = b.MatchedStyle,
                 opus_url = b.OpusUrl,
                 type = b.IsSummary ? "SUMMARY" : string.Empty,
+                type_label = b.WorkKindLabel ?? string.Empty,
                 unattributable = b.IsUnattributable,
                 is_summary = b.IsSummary,
                 merged_text = b.MergedText,

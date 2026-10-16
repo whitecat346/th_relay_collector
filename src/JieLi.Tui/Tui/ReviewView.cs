@@ -159,7 +159,7 @@ public sealed class ReviewView
         // ---- 页脚 ----
         _c.Line(_c.Dim + ConsoleHost.Rule(width) + _c.Reset);
         if (_toast is not null) _c.Line(_c.Yellow + _toast + _c.Reset);
-        _c.Line(_c.Dim + "Enter 确认  X 忽略  R 撤销  B 棒号  T 时段  U 创作者  P 代发者  N 备注  D 打开链接  S 保存  I 过滤  Esc 返回" + _c.Reset);
+        _c.Line(_c.Dim + "Enter 确认  X 忽略  R 撤销  B 棒号  T 时段  U 创作者  K 类型  P 代发者  N 备注  D 打开链接  S 保存  I 过滤  Esc 返回" + _c.Reset);
     }
 
     /// <summary>返回 true 表示需要重新渲染由调用方控制；这里直接处理全部按键。</summary>
@@ -253,6 +253,15 @@ public sealed class ReviewView
                     cur.ManualNote = string.IsNullOrWhiteSpace(v) ? null : v.Trim();
                     return "备注已保存";
                 });
+                break;
+            case ConsoleKey.K:
+                EditField("作品类型（插画/文章/视频/MMD/手书/COS/漫画/音乐…）",
+                          string.IsNullOrWhiteSpace(cur.TypeLabel) ? BarParser.InferWorkKind(cur.Type, cur.MergedText) : cur.TypeLabel,
+                          v =>
+                          {
+                              cur.TypeLabel = string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+                              return "类型已改为 " + (cur.TypeLabel ?? "（自动）");
+                          });
                 break;
         }
     }

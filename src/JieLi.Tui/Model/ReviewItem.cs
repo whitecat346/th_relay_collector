@@ -34,6 +34,8 @@ public sealed class ReviewItem
 
     [JsonPropertyName("opus_url")] public string OpusUrl { get; set; } = string.Empty;
     [JsonPropertyName("type")] public string Type { get; set; } = string.Empty;
+    /// <summary>作品形态的中文标签（插画/视频/文章…），进入 CSV 的"类型"列。</summary>
+    [JsonPropertyName("type_label")] public string TypeLabel { get; set; } = string.Empty;
     [JsonPropertyName("conflicts")] public List<string> Conflicts { get; set; } = new();
     [JsonPropertyName("notes")] public List<string> Notes { get; set; } = new();
     [JsonPropertyName("unattributable")] public bool Unattributable { get; set; }
@@ -129,6 +131,7 @@ public static class ReviewStore
                     PrevOriginalAuthor = StrOrNull(r, "prev_original_author"),
                     OpusUrl = Str(r, "opus_url"),
                     Type = Str(r, "type"),
+                    TypeLabel = Str(r, "type_label"),
                     Unattributable = Bool(r, "unattributable"),
                     IsSummary = Bool(r, "is_summary"),
                     MatchedStyle = StrOrNull(r, "matched_style"),

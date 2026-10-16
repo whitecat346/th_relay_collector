@@ -21,6 +21,9 @@ public static class Program
         string? pipelineTarget = null;
         string? reviewTarget = null;
         long? selfTestReview = null;
+        string? renderTarget = null;
+        string? archiveTarget = null;
+        bool allowUnconfirmed = false;
         string? outDir = null;
         bool forcePlain = false;
 
@@ -51,6 +54,15 @@ public static class Program
                     break;
                 case "--selftest-review":
                     if (i + 1 < args.Length) selfTestReview = ParseTopicId(args[++i]);
+                    break;
+                case "--render":
+                    if (i + 1 < args.Length) renderTarget = args[++i];
+                    break;
+                case "--archive-root":
+                    if (i + 1 < args.Length) archiveTarget = args[++i];
+                    break;
+                case "--allow-unconfirmed":
+                    allowUnconfirmed = true;
                     break;
                 case "--out":
                     if (i + 1 < args.Length) outDir = args[++i];
@@ -98,6 +110,12 @@ public static class Program
         {
             var workRootForTest = outDir ?? Path.Combine(root, "relay-tool", "work");
             return RunReviewSelfTest(workRootForTest, selfTestReview.Value);
+        }
+
+        if (renderTarget is not null)
+        {
+            var workRootForRender = outDir ?? Path.Combine(root, "relay-tool", "work");
+            return RunRender(root, workRootForRender, renderTarget, archiveTarget, allowUnconfirmed);
         }
 
         var scanner = new Scanner(root);
@@ -155,6 +173,64 @@ public static class Program
             Log("采集异常中止：" + ex.GetType().Name + ": " + ex.Message);
             if (ex.InnerException is not null) Log("  内层：" + ex.InnerException.Message);
             return 4;
+        }
+    }
+
+    // ------------------------------------------------------------- 渲染模式（M5）
+
+    private static int RunRender(string root, string workRoot, string target, string? archiveRoot, bool allowUnconfirmed)
+    {
+        long? topicId = ParseTopicId(target);
+        if (topicId is null) { Console.Error.WriteLine($"无法从「{target}」解析出 topic_id。"); return 2; }
+
+        using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        void Log(string m) => w.WriteLine(m);
+
+        var manifest = TopicCollector.LoadManifest(workRoot, topicId.Value);
+        var metaPath = ArchiveMeta.PathFor(workRoot, topicId.Value);
+
+        // meta.yml 不存在时生成草稿（宣传信息是人工拍板项，草稿只做提示，绝不填机器猜测值）
+        if (!File.Exists(metaPath))
+        {
+            var dir = Path.GetDirectoryName(metaPath)!;
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(metaPath,
+                ArchiveMeta.DraftYaml(manifest?.Name ?? topicId.Value.ToString(), topicId.Value,
+                                      manifest?.TopicUrl ?? "", null),
+                new UTF8Encoding(false));
+            Log($"未找到 meta.yml，已生成草稿：{metaPath}");
+            Log("请先填写主催与宣传链接，再重新运行 --render。");
+            return 1;
+        }
+
+        var meta = ArchiveMeta.Load(metaPath);
+        var items = ReviewStore.Load(workRoot, topicId.Value);
+        if (items.Count == 0)
+        {
+            Log($"没有找到 review.jsonl（先跑 --pipeline {topicId}）。");
+            return 2;
+        }
+
+        var archiveDir = archiveRoot ?? root;
+        try
+        {
+            var r = ArchiveRenderer.Render(workRoot, topicId.Value, meta, items, archiveDir, allowUnconfirmed);
+            Log($"话题「{meta.Title ?? manifest?.Name}」渲染完成");
+            Log($"  输出目录   {r.OutputDirectory}");
+            Log($"  整点棒     {r.BarCount - r.ExCount} 根");
+            Log($"  ex 棒      {r.ExCount} 根");
+            Log($"  棒数异常   {r.UnnumberedCount} 条（按时间排序）");
+            Log($"  CSV        {r.CsvPath}");
+            Log($"  Markdown   {r.MdPath}");
+            Log($"  只读报告   {r.ReportPath}");
+            foreach (var warn in r.Warnings) Log($"  ⚠ {warn}");
+            return 0;
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log("渲染被拒绝（人工确认闸门）：");
+            Log("  " + ex.Message);
+            return 1;
         }
     }
 

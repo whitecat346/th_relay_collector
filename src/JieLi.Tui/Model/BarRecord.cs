@@ -147,6 +147,9 @@ public sealed class ParsedBar
     /// <summary>本条的原始合并正文（用于异常判定与人工核对）。</summary>
     public string MergedText { get; set; } = string.Empty;
 
+    /// <summary>作品形态标签（插画/视频/文章…）—— 对应既有 CSV 的"类型"列。</summary>
+    public string? WorkKindLabel { get; set; }
+
     /// <summary>
     /// 棒数异常：经过各种方法仍无法确定棒号，按用户要求**按时间排序**处理。
     /// 这类条目很常见，不属于"无法归属"（无法归属是连归属都可能错的更严重情况）。
