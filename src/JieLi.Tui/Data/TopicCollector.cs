@@ -208,9 +208,12 @@ public sealed class TopicCollector
                 prev_proxy_name = b.PrevProxyName,
                 matched_style = b.MatchedStyle,
                 opus_url = b.OpusUrl,
+                type = b.IsSummary ? "SUMMARY" : string.Empty,
+                unattributable = b.IsUnattributable,
+                is_summary = b.IsSummary,
+                merged_text = b.MergedText,
                 conflicts = b.Conflicts,
                 notes = b.Notes,
-                unattributable = b.IsUnattributable,
             }, JsonlOut));
         }
     }

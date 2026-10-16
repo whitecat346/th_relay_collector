@@ -2,6 +2,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 using JieLi.Tui.Data;
+using JieLi.Tui.Model;
 using JieLi.Tui.Tui;
 
 namespace JieLi.Tui;
@@ -17,6 +18,9 @@ public static class Program
         string? collectTarget = null;
         string? parseTarget = null;
         string? rosterTarget = null;
+        string? pipelineTarget = null;
+        string? reviewTarget = null;
+        long? selfTestReview = null;
         string? outDir = null;
         bool forcePlain = false;
 
@@ -38,6 +42,15 @@ public static class Program
                     break;
                 case "--roster":
                     if (i + 1 < args.Length) rosterTarget = args[++i];
+                    break;
+                case "--pipeline":
+                    if (i + 1 < args.Length) pipelineTarget = args[++i];
+                    break;
+                case "--review":
+                    if (i + 1 < args.Length) reviewTarget = args[++i];
+                    break;
+                case "--selftest-review":
+                    if (i + 1 < args.Length) selfTestReview = ParseTopicId(args[++i]);
                     break;
                 case "--out":
                     if (i + 1 < args.Length) outDir = args[++i];
@@ -68,6 +81,24 @@ public static class Program
 
         if (rosterTarget is not null)
             return RunRoster(root, rosterTarget, outDir);
+
+        if (pipelineTarget is not null)
+            return RunPipeline(root, pipelineTarget, outDir);
+
+        // 人工确认视图（M4）
+        if (reviewTarget is not null)
+        {
+            var workRootForReview = outDir ?? Path.Combine(root, "relay-tool", "work");
+            long? rid = ParseTopicId(reviewTarget);
+            if (rid is null) { Console.Error.WriteLine("--review 需要 topic_id 或话题链接。"); return 2; }
+            return RunReview(root, workRootForReview, rid.Value, forcePlain);
+        }
+
+        if (selfTestReview is not null)
+        {
+            var workRootForTest = outDir ?? Path.Combine(root, "relay-tool", "work");
+            return RunReviewSelfTest(workRootForTest, selfTestReview.Value);
+        }
 
         var scanner = new Scanner(root);
         var activities = scanner.ScanAll();
@@ -127,7 +158,146 @@ public static class Program
         }
     }
 
-    // ------------------------------------------------------------- 解析模式
+    // ------------------------------------------------------------- 人工确认（M4）
+
+    private static int RunReview(string root, string workRoot, long topicId, bool forcePlain)
+    {
+        var manifest = TopicCollector.LoadManifest(workRoot, topicId);
+        var host = new ConsoleHost(forcePlain);
+        var view = new ReviewView(host, workRoot, topicId, manifest?.Name ?? topicId.ToString());
+
+        if (!host.Interactive)
+        {
+            // 非交互：渲染一帧就退出，便于自动化验收
+            host.BeginFrame();
+            view.Render(ConsoleHost.WindowWidth, ConsoleHost.WindowHeight);
+            host.EndFrame();
+            return 0;
+        }
+
+        while (!view.ShouldExit)
+        {
+            host.BeginFrame();
+            view.Render(ConsoleHost.WindowWidth, ConsoleHost.WindowHeight);
+            host.EndFrame();
+            view.HandleKey(Console.ReadKey(intercept: true));
+        }
+        host.Restore();
+        return 0;
+    }
+
+    /// <summary>
+    /// M4 状态机自检：用**合成按键**驱动 ReviewView（沙箱无交互 TTY），
+    /// 验证 渲染 → 确认/忽略/改棒号 → 保存 → 重跑断言 的闭环。
+    /// </summary>
+    private static int RunReviewSelfTest(string workRoot, long topicId)
+    {
+        using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        void Log(string m) => w.WriteLine(m);
+
+        var manifest = TopicCollector.LoadManifest(workRoot, topicId);
+        var host = new ConsoleHost(forcePlain: true);
+        var view = new ReviewView(host, workRoot, topicId, manifest?.Name ?? topicId.ToString());
+
+        Log($"自检话题 {topicId}（{manifest?.Name}）");
+        host.BeginFrame(); view.Render(160, 44); host.EndFrame();
+        Log("① 初始渲染完成（上面应显示待确认统计与断言回执）");
+        Log($"   ShouldExit={view.ShouldExit}");
+
+        // 合成按键：确认 3 条、忽略 1 条、改 1 条棒号、切换过滤、保存
+        var script = new (ConsoleKey, string)[]
+        {
+            (ConsoleKey.Enter,  "确认当前条"),
+            (ConsoleKey.DownArrow, "下移"),
+            (ConsoleKey.Enter,  "确认当前条"),
+            (ConsoleKey.DownArrow, "下移"),
+            (ConsoleKey.Enter,  "确认当前条"),
+            (ConsoleKey.DownArrow, "下移"),
+            (ConsoleKey.X,      "忽略当前条"),
+            (ConsoleKey.I,      "切换为显示全部"),
+            (ConsoleKey.DownArrow, "下移"),
+            (ConsoleKey.S,      "保存"),
+        };
+        foreach (var (k, desc) in script)
+        {
+            view.HandleKey(new ConsoleKeyInfo('\0', k, false, false, false));
+            Log($"② 按键 {k,-10} ({desc}) → ShouldExit={view.ShouldExit}");
+        }
+        Log("");
+        host.BeginFrame(); view.Render(160, 44); host.EndFrame();
+        Log("③ 操作后重新渲染完成（断言回执应随确认同步变化）");
+
+        var items = ReviewStore.Load(workRoot, topicId);
+        Log("");
+        Log("④ 落盘核对");
+        Log($"   条目总数   {items.Count}");
+        Log($"   已确认     {items.Count(i => i.Confirmed)}");
+        Log($"   已忽略     {items.Count(i => i.Ignored)}");
+        Log($"   仍待确认   {items.Count(i => !i.Confirmed && !i.Ignored)}");
+        bool persisted = items.Any(i => i.Confirmed) && items.Any(i => i.Ignored);
+        Log(persisted ? "   ✓ 确认/忽略状态已持久化到 review.jsonl" : "   ✗ 状态未持久化");
+        return persisted ? 0 : 1;
+    }
+
+    // ------------------------------------------------------------- 流水线模式
+
+    /// <summary>
+    /// 一条命令跑完 采集 → 解析 → 写 review.jsonl，供 TUI 人工确认。
+    /// 这是 M4「半自动辅助器」的入口：非交互入口只产出草稿与待确认清单，
+    /// 绝不产出最终 CSV/md（最终写出必须经过 TUI 确认，符合设计阶段定下的防线）。
+    /// </summary>
+    private static int RunPipeline(string root, string target, string? outDir)
+    {
+        long? topicId = ParseTopicId(target);
+        if (topicId is null) { Console.Error.WriteLine($"无法从「{target}」解析出 topic_id。"); return 2; }
+
+        var workRoot = outDir ?? Path.Combine(root, "relay-tool", "work");
+        using var writer = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        void Log(string m) => writer.WriteLine(m);
+
+        // 1) 采集
+        Log("【1/3】采集话题");
+        using var client = new BilibiliClient();
+        var collector = new TopicCollector(client);
+        CollectManifest manifest;
+        try
+        {
+            manifest = collector.CollectAsync(topicId.Value, workRoot,
+                m => Log("  " + m), CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch (CollectException ex)
+        {
+            Log("  采集中止（硬失败）：" + ex.Message);
+            return 3;
+        }
+        catch (Exception ex)
+        {
+            Log("  采集异常中止：" + ex.GetType().Name + ": " + ex.Message);
+            if (ex.InnerException is not null) Log("  内层：" + ex.InnerException.Message);
+            return 4;
+        }
+
+        // 2) 解析与交叉校验
+        Log("");
+        Log("【2/3】解析与交叉校验");
+        var cards = TopicCollector.LoadCards(workRoot, topicId.Value);
+        var result = ArtifactValidator.Validate(cards, manifest.DynamicsReported, manifest.Name);
+        Log($"  话题标签 {SummaryExtractor.InferTopicTag(cards, manifest.Name) ?? "（未识别）"}");
+        Log($"  总结名册 {(result.RosterCardId is null ? "未找到" : $"opus/{result.RosterCardId}（{result.RosterSlots.Count} 个棒位）")}");
+        Log($"  有棒号/EX {result.Attributed}   无法归属 {result.Unattributable}   含冲突 {result.ConflictCount}");
+        foreach (var f in result.AssertionFailures) Log("  ✗ " + f);
+
+        // 3) 写 review.jsonl
+        Log("");
+        Log("【3/3】写 review.jsonl");
+        TopicCollector.WriteReviewAsync(workRoot, topicId.Value, result, CancellationToken.None)
+                       .GetAwaiter().GetResult();
+        var rp = Path.Combine(workRoot, topicId.Value.ToString(), "review.jsonl");
+        Log($"  {rp}  ({new FileInfo(rp).Length:N0} 字节)");
+        Log("");
+        Log("下一步：运行 jieli 进入 TUI → 选择本话题进行人工确认（待确认项修完才能产出最终归档）。");
+        return 0;
+    }
 
     private static int RunParse(string root, string target, string? outDir)
     {
