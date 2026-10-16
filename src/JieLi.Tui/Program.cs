@@ -1,9 +1,13 @@
 #nullable enable
-using System.Text;
-using System.Text.RegularExpressions;
 using JieLi.Tui.Data;
 using JieLi.Tui.Model;
 using JieLi.Tui.Tui;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace JieLi.Tui;
 
@@ -27,6 +31,7 @@ public static class Program
         bool backfill = false;
         bool applyBackfill = false;
         bool fixHeader = false;
+        string? opusTarget = null;
         string? outDir = null;
         bool forcePlain = false;
 
@@ -76,6 +81,9 @@ public static class Program
                 case "--fix-header":
                     fixHeader = true;
                     break;
+                case "--opus":
+                    if (i + 1 < args.Length) opusTarget = args[++i];
+                    break;
                 case "--out":
                     if (i + 1 < args.Length) outDir = args[++i];
                     break;
@@ -113,9 +121,20 @@ public static class Program
         if (reviewTarget is not null)
         {
             var workRootForReview = outDir ?? Path.Combine(root, "relay-tool", "work");
+
+            // 两种输入模式：话题模式用 topic_id（数字），单链接模式用 opus_<id> 目录名
             long? rid = ParseTopicId(reviewTarget);
-            if (rid is null) { Console.Error.WriteLine("--review 需要 topic_id 或话题链接。"); return 2; }
-            return RunReview(root, workRootForReview, rid.Value, forcePlain);
+            if (rid is not null && ReviewStore.Exists(workRootForReview, rid.Value))
+                return RunReview(root, workRootForReview, rid.Value, forcePlain);
+
+            var slug = rid is not null ? "opus_" + rid.Value : reviewTarget.Trim();
+            if (ReviewStore.Exists(workRootForReview, slug))
+                return RunReview(root, workRootForReview, rid ?? 0, forcePlain, slug);
+
+            Console.Error.WriteLine($"找不到已采集的数据：既没有 work/{reviewTarget}/review.jsonl，"
+                                    + $"也没有 work/opus_{reviewTarget}/review.jsonl。");
+            Console.Error.WriteLine("  话题模式先跑 --pipeline <topic_id>；单链接模式先跑 --opus <opus链接>。");
+            return 2;
         }
 
         if (selfTestReview is not null)
@@ -132,6 +151,13 @@ public static class Program
 
         if (backfill)
             return RunBackfill(root, applyBackfill, fixHeader);
+
+        // 单链接模式（接力没有建 topic 的情形）
+        if (opusTarget is not null)
+        {
+            var workRootForOpus = outDir ?? Path.Combine(root, "relay-tool", "work");
+            return RunOpus(workRootForOpus, opusTarget);
+        }
 
         var scanner = new Scanner(root);
         var activities = scanner.ScanAll();
@@ -189,6 +215,91 @@ public static class Program
             if (ex.InnerException is not null) Log("  内层：" + ex.InnerException.Message);
             return 4;
         }
+    }
+
+    // ------------------------------------------------------------- 单链接模式
+
+    /// <summary>
+    /// 从**单个接力链接**出发采集（接力没有建 topic 时用这个）。
+    /// 输入可以是 `https://www.bilibili.com/opus/&lt;id&gt;` 或裸 id。
+    /// </summary>
+    private static int RunOpus(string workRoot, string target)
+    {
+        var opusId = ParseOpusId(target);
+        if (opusId is null)
+        {
+            Console.Error.WriteLine($"无法从「{target}」解析出 opus id。"
+                                    + "请传 https://www.bilibili.com/opus/<数字id> 形式的链接或裸 id。");
+            return 2;
+        }
+
+        using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        void Log(string m) => w.WriteLine(m);
+
+        Log($"单链接模式：起始 opus/{opusId}");
+        Log("  说明：接力没有建话题时用这个模式。会抓正文与评论，识别「上一棒/下一棒」，");
+        Log("        并沿正文/评论里的 opus 链接继续遍历（只 @ 名字而无链接时无法自动跟进）。");
+        Log("");
+
+        using var client = new BilibiliClient();
+        var collector = new SingleLinkCollector(client);
+
+        SingleLinkResult result;
+        try
+        {
+            result = collector.Collect(opusId, Log);
+        }
+        catch (CollectException ex)
+        {
+            Log("采集中止：" + ex.Message);
+            return 3;
+        }
+        catch (Exception ex)
+        {
+            Log($"采集异常：{ex.GetType().Name}: {ex.Message}");
+            if (ex.InnerException is not null) Log("  内层：" + ex.InnerException.Message);
+            return 4;
+        }
+
+        if (result.Entries.Count == 0)
+        {
+            Log("没有抓到任何帖子（见上面的警告）。");
+            return 1;
+        }
+
+        string dir;
+        try
+        {
+            dir = collector.WriteAsync(workRoot, opusId, result).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Log("落盘失败：" + ex.Message);
+            return 2;
+        }
+
+        Log("");
+        Log("———— 采集清单 ————");
+        Log($"  抓到帖子     : {result.Entries.Count} 条（沿链接遍历）");
+        Log($"  含评论       : {result.Entries.Count(e => e.CommentCount > 0)} 条帖子有评论");
+        Log($"  输出目录     : {dir}");
+        Log($"  review.jsonl : {Path.Combine(dir, "review.jsonl")}");
+        foreach (var warn in result.Warnings) Log($"  ⚠ {warn}");
+        Log("");
+        Log($"下一步：jieli --review opus_{opusId}   进入 TUI 人工确认（与话题模式完全一致的界面）");
+        return 0;
+    }
+
+    /// <summary>从链接或裸串里取出 opus id。</summary>
+    private static string? ParseOpusId(string s)
+    {
+        s = s.Trim();
+        if (Regex.IsMatch(s, @"^\d{6,}$")) return s;
+        var m = Regex.Match(s, @"/opus/(\d{6,})", RegexOptions.IgnoreCase);
+        if (m.Success) return m.Groups[1].Value;
+        m = Regex.Match(s, @"(?:^|[^\d])(\d{15,})(?:[^\d]|$)");
+        if (m.Success) return m.Groups[1].Value;
+        return null;
     }
 
     // ------------------------------------------------------------- 旧归档回填（M6）
@@ -315,11 +426,12 @@ public static class Program
 
     // ------------------------------------------------------------- 人工确认（M4）
 
-    private static int RunReview(string root, string workRoot, long topicId, bool forcePlain)
+    private static int RunReview(string root, string workRoot, long topicId, bool forcePlain, string? slug = null)
     {
-        var manifest = TopicCollector.LoadManifest(workRoot, topicId);
+        var manifest = topicId > 0 ? TopicCollector.LoadManifest(workRoot, topicId) : null;
+        var title = manifest?.Name ?? slug ?? topicId.ToString();
         var host = new ConsoleHost(forcePlain);
-        var view = new ReviewView(host, workRoot, topicId, manifest?.Name ?? topicId.ToString());
+        var view = new ReviewView(host, workRoot, topicId, title, slug);
 
         if (!host.Interactive)
         {
@@ -671,6 +783,7 @@ public static class Program
         Console.WriteLine("  jieli                                  只读审阅已有归档（默认视图，不写任何文件）");
         Console.WriteLine("  jieli --slug <活动目录名>               直接进某活动的棒表");
         Console.WriteLine("  jieli --pipeline <topic_id|话题链接>    采集 + 解析 + 写 review.jsonl（需网络）");
+        Console.WriteLine("  jieli --opus     <opus链接|opus_id>     单链接模式：接力**没建话题**时用（需网络）");
         Console.WriteLine("  jieli --collect  <topic_id|话题链接>    只采集（需网络）");
         Console.WriteLine("  jieli --parse    <topic_id>            只解析校验，打印完整棒表（离线）");
         Console.WriteLine("  jieli --roster   <topic_id>            只抽主办总结名册（离线）");

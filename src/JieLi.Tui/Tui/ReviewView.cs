@@ -27,6 +27,8 @@ public sealed class ReviewView
     private readonly string _workRoot;
     private readonly long _topicId;
     private readonly string _topicName;
+    /// <summary>目录名。话题模式为 null（用 topicId）；单链接模式为 `opus_&lt;id&gt;`。</summary>
+    private readonly string? _slug;
 
     private List<ReviewItem> _items;
     private int _index;
@@ -41,13 +43,17 @@ public sealed class ReviewView
 
     public bool ShouldExit { get; private set; }
 
-    public ReviewView(ConsoleHost c, string workRoot, long topicId, string topicName)
+    public ReviewView(ConsoleHost c, string workRoot, long topicId, string topicName, string? slug = null)
     {
         _c = c;
         _workRoot = workRoot;
         _topicId = topicId;
         _topicName = topicName;
-        _items = ReviewStore.Load(workRoot, topicId);
+        _slug = slug;
+        // 单链接模式的目录名是 opus_<id>，不能按数字 topicId 去读
+        _items = slug is { Length: > 0 }
+            ? ReviewStore.Load(workRoot, slug)
+            : ReviewStore.Load(workRoot, topicId);
 
         // 排序：按棒号升序（无棒号者按时段排到后面），便于按接力顺序通读
         _items = _items
@@ -300,8 +306,19 @@ public sealed class ReviewView
         var active = _items.Where(i => !i.Ignored && !i.IsSummary).ToList();
         var numbered = active.Where(i => i.Bar.HasValue).ToList();
         var dups = numbered.GroupBy(i => i.Bar!.Value).Where(g => g.Count() > 1).Select(g => g.Key).ToList();
-        int max = numbered.Select(i => i.Bar!.Value).DefaultIfEmpty(0).Max();
-        var missing = Enumerable.Range(1, max).Where(n => !numbered.Any(i => i.Bar == n)).ToList();
+
+        // 缺棒只统计**已知棒位之间**的空隙：单链接模式只覆盖链上的少数帖子，
+        // 从 1 数到 max 会把两端之外都算成缺失（实测只给 1 条第27棒时误报"缺棒 26"）。
+        var missing = new List<int>();
+        if (numbered.Count >= 2)
+        {
+            int min = numbered.Min(i => i.Bar!.Value);
+            int max = numbered.Max(i => i.Bar!.Value);
+            missing = Enumerable.Range(min, max - min + 1)
+                                 .Where(n => !numbered.Any(i => i.Bar == n))
+                                 .ToList();
+        }
+
         _assertions = (numbered.Count + active.Count(i => i.IsEx), dups.Count, missing,
                        active.Count(i => i.Bar is null && !i.IsEx));
     }
@@ -310,7 +327,8 @@ public sealed class ReviewView
     {
         try
         {
-            ReviewStore.Save(_workRoot, _topicId, _items);
+            if (_slug is { Length: > 0 }) ReviewStore.Save(_workRoot, _slug, _items);
+            else ReviewStore.Save(_workRoot, _topicId, _items);
             _dirty = false;
             _toast = $"已保存 review.jsonl（{_items.Count} 条）";
         }

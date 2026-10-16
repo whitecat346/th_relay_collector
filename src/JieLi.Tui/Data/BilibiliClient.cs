@@ -198,6 +198,94 @@ public sealed class BilibiliClient : IDisposable
         if (wait > 0) await Task.Delay(wait, ct);
     }
 
+    // ---------------------------------------------------------------- 单链接模式
+
+    /// <summary>
+    /// 抓取 opus 页面 HTML。
+    /// 为什么必须抓 HTML 而不是只用 JSON 接口：实测 `x/polymer/web-dynamic/v1/detail`
+    /// 对 DRAW 型帖子的 `desc.text` 为 null、`rich_text_nodes` 为空、`major.draw` 只有图片 URL，
+    /// **正文完全拿不到**；而页面里的 `__INITIAL_STATE__.detail.modules[].module_content.paragraphs`
+    /// 有完整正文（含 @ 与链接节点，实测 116 段）。
+    /// </summary>
+    public async Task<string> GetOpusHtmlAsync(string opusId, CancellationToken ct = default)
+    {
+        var url = $"https://www.bilibili.com/opus/{opusId}";
+        await ThrottleAsync(ct);
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        req.Headers.Referrer = new Uri("https://www.bilibili.com/");
+        req.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,*/*");
+        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        _lastRequestUtc = DateTime.UtcNow;
+
+        if (!resp.IsSuccessStatusCode)
+            throw new CollectException($"抓取 opus/{opusId} 失败：HTTP {(int)resp.StatusCode}");
+        if (!body.Contains("__INITIAL_STATE__", StringComparison.Ordinal))
+            throw new CollectException(
+                $"opus/{opusId} 页面里没有 __INITIAL_STATE__（帖子可能已删除，或页面要求登录/需要 JS 渲染）");
+        return body;
+    }
+
+    /// <summary>
+    /// 抓取评论（含楼中楼）。实测 `x/v2/reply?oid=&lt;comment_id_str&gt;&amp;type=12` 免登录可用（code=0）；
+    /// 而 `x/v2/reply/wbi/main` 返回 -403 访问权限不足，**不要用**。
+    /// </summary>
+    public async Task<List<CommentItem>> GetCommentsAsync(
+        string oid, int type, long upMid, CancellationToken ct = default, int maxPages = 5)
+    {
+        var all = new List<CommentItem>();
+        for (int pn = 1; pn <= maxPages; pn++)
+        {
+            var url = $"https://api.bilibili.com/x/v2/reply?oid={Uri.EscapeDataString(oid)}&type={type}"
+                      + $"&sort=2&ps=20&pn={pn}";
+            var json = await GetJsonAsync(url, 0, ct);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            // 评论接口失败不该中断整个采集（有些帖子关闭了评论）
+            if (!root.TryGetProperty("code", out var codeEl) || codeEl.GetInt32() != 0) break;
+            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) break;
+
+            var page = OpusContentExtractor.ParseComments(data, upMid);
+            all.AddRange(page);
+
+            int count = 0, size = 20, num = pn;
+            if (data.TryGetProperty("page", out var pageEl))
+            {
+                if (pageEl.TryGetProperty("count", out var c) && c.ValueKind == JsonValueKind.Number) count = c.GetInt32();
+                if (pageEl.TryGetProperty("size", out var s) && s.ValueKind == JsonValueKind.Number) size = Math.Max(1, s.GetInt32());
+                if (pageEl.TryGetProperty("num", out var n) && n.ValueKind == JsonValueKind.Number) num = n.GetInt32();
+            }
+            if (page.Count == 0 || num * size >= count) break;
+        }
+        return all;
+    }
+
+    /// <summary>结构化元数据（交叉校验用）。实测 code=0 可用，但正文拿不到，只能补 id/type/author。</summary>
+    public async Task<(string? IdStr, string? Type, long Mid, string? Name, long PubTs)?> GetDynamicDetailAsync(
+        string opusId, CancellationToken ct = default)
+    {
+        var url = $"https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id={Uri.EscapeDataString(opusId)}";
+        var json = await GetJsonAsync(url, 0, ct);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        if (!root.TryGetProperty("code", out var c) || c.GetInt32() != 0) return null;
+        if (!root.TryGetProperty("data", out var d) || !d.TryGetProperty("item", out var item)) return null;
+
+        string? idStr = item.TryGetProperty("id_str", out var i) ? i.GetString() : null;
+        string? type = item.TryGetProperty("type", out var t) ? t.GetString() : null;
+        long mid = 0; string? name = null; long pubTs = 0;
+        if (item.TryGetProperty("modules", out var mods) && mods.TryGetProperty("module_author", out var au))
+        {
+            if (au.TryGetProperty("mid", out var m) && m.ValueKind == JsonValueKind.Number) mid = m.GetInt64();
+            if (au.TryGetProperty("name", out var n)) name = n.GetString();
+            if (au.TryGetProperty("pub_ts", out var p) && p.ValueKind == JsonValueKind.Number) pubTs = p.GetInt64();
+        }
+        return (idStr, type, mid, name, pubTs);
+    }
+
+    // ---------------------------------------------------------------- 内部
+
     /// <summary>把 items[] 里运行时键名（dynamic_card_item / video_card_item / …）归一化成 CardItem。</summary>
     private static List<CardItem> ParseItems(string json)
     {

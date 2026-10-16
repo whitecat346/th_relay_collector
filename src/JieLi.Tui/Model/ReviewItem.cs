@@ -85,10 +85,19 @@ public static class ReviewStore
         WriteIndented = false,
     };
 
-    public static string PathFor(string workRoot, long topicId)
-        => Path.Combine(workRoot, topicId.ToString(), "review.jsonl");
+    public static string PathFor(string workRoot, long topicId) => PathFor(workRoot, topicId.ToString());
+
+    /// <summary>目录名版本 —— 单链接模式的目录名是 `opus_&lt;id&gt;`，不是数字。</summary>
+    public static string PathFor(string workRoot, string slug)
+        => Path.Combine(workRoot, slug, "review.jsonl");
 
     public static bool Exists(string workRoot, long topicId) => File.Exists(PathFor(workRoot, topicId));
+
+    public static bool Exists(string workRoot, string slug) => File.Exists(PathFor(workRoot, slug));
+
+    public static List<ReviewItem> Load(string workRoot, string slug) => LoadByDir(workRoot, slug);
+
+    public static void Save(string workRoot, string slug, IEnumerable<ReviewItem> items) => SaveByDir(workRoot, slug, items);
 
     /// <summary>
     /// 读取 review.jsonl。
@@ -97,8 +106,11 @@ public static class ReviewStore
     /// 表现为自检里 已确认 3 条、重新加载却是 0 条。这里做大小写无关查找，彻底消除该隐患。
     /// </summary>
     public static List<ReviewItem> Load(string workRoot, long topicId)
+        => LoadByDir(workRoot, topicId.ToString());
+
+    private static List<ReviewItem> LoadByDir(string workRoot, string dirName)
     {
-        var path = PathFor(workRoot, topicId);
+        var path = PathFor(workRoot, dirName);
         if (!File.Exists(path)) return new List<ReviewItem>();
 
         var list = new List<ReviewItem>();
@@ -149,8 +161,11 @@ public static class ReviewStore
     }
 
     public static void Save(string workRoot, long topicId, IEnumerable<ReviewItem> items)
+        => SaveByDir(workRoot, topicId.ToString(), items);
+
+    private static void SaveByDir(string workRoot, string dirName, IEnumerable<ReviewItem> items)
     {
-        var path = PathFor(workRoot, topicId);
+        var path = PathFor(workRoot, dirName);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         using var w = new StreamWriter(path, false, new UTF8Encoding(false));
         foreach (var it in items) w.WriteLine(JsonSerializer.Serialize(it, Out));

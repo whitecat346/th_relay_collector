@@ -47,12 +47,12 @@ public static class ArtifactValidator
 
     public static ValidationResult Validate(IEnumerable<TopicCard> cards, int? dynamicsReported = null, string? topicName = null)
     {
-        var result = new ValidationResult();
         var cardList = cards.ToList();
 
         // 先推断话题标签：它是"这条动态属于本接力"的最强信号，供无"第N棒"格式的活动使用
         var tag = SummaryExtractor.InferTopicTag(cardList, topicName);
 
+        var bars = new List<ParsedBar>();
         foreach (var card in cardList)
         {
             var bar = BarParser.Parse(card, tag);
@@ -72,12 +72,50 @@ public static class ArtifactValidator
             }
 
             BarParser.ComputeDeviation(bar);
-            result.Bars.Add(bar);
+            bars.Add(bar);
         }
-        var bars = result.Bars;
+
+        return FinishValidation(bars, cardList, dynamicsReported, tag, SummaryExtractor.FindRoster(cardList));
+    }
+
+    /// <summary>
+    /// 供**单链接模式**复用：帖子正文来自 opus 页面（而非话题卡片），已先行解析成 ParsedBar。
+    /// 与 <see cref="Validate"/> 共用第二遍处理与断言，保证两种输入模式产出同构结果。
+    ///
+    /// ⚠ 关键差异：单链接模式**只知道链上的那几条帖子**，不能断言"1..最高棒 之间缺了哪些"——
+    /// 实测只给 1 条帖子（第27棒）时会误报"缺棒 26"。因此这里把"缺棒断言"收紧为
+    /// **只检查已知棒位之间的空隙**（首尾之外不算缺）。
+    /// </summary>
+    public static ValidationResult ValidateFromBars(
+        List<ParsedBar> bars, int? dynamicsReported = null, string? topicTag = null)
+    {
+        // 名册发现需要 TopicCard 视图；用 ParsedBar 携带的 MergedText 还原即可
+        var pseudo = bars.Select(b => new TopicCard
+        {
+            Id = b.CardId,
+            MergedText = b.MergedText,
+            AuthorName = b.PosterName,
+        }).ToList();
+
+        return FinishValidation(bars, pseudo, dynamicsReported, topicTag,
+                                SummaryExtractor.FindRoster(pseudo),
+                                missingBarsOnlyWithinKnownRange: true);
+    }
+
+    /// <summary>两种输入模式共用的第二遍处理与三道断言。</summary>
+    private static ValidationResult FinishValidation(
+        List<ParsedBar> bars,
+        List<TopicCard> cardList,
+        int? dynamicsReported,
+        string? tag,
+        (TopicCard? Card, List<RosterSlot> Slots) roster,
+        bool missingBarsOnlyWithinKnownRange = false)
+    {
+        var result = new ValidationResult();
+        result.Bars.AddRange(bars);
 
         // 名册（总结动态）：ai_guild.md 的"收集方法优先级 1"，用于校验棒号与时段
-        var (rosterCard, rosterSlots) = SummaryExtractor.FindRoster(cardList);
+        var (rosterCard, rosterSlots) = roster;
         result.RosterCardId = rosterCard?.Id;
         result.RosterSlots = rosterSlots;
 
@@ -104,9 +142,22 @@ public static class ArtifactValidator
         else
         {
             int max = numbered.Max(b => b.BarNumber!.Value);
-            var missing = Enumerable.Range(1, max).Where(i => !numbered.Any(b => b.BarNumber == i)).ToList();
+            int min = numbered.Min(b => b.BarNumber!.Value);
+
+            // 单链接模式只知道链上的少数帖子：只检查**已知棒位之间**的空隙，
+            // 首尾之外不算缺（否则只给 1 条第27棒时会误报"缺棒 26"）。
+            int lo = missingBarsOnlyWithinKnownRange ? min : 1;
+            int hi = missingBarsOnlyWithinKnownRange ? max : max;
+            var missing = (lo <= hi ? Enumerable.Range(lo, hi - lo + 1) : Enumerable.Empty<int>())
+                          .Where(i => !numbered.Any(b => b.BarNumber == i)).ToList();
+
             if (missing.Count > 0)
-                result.AssertionFailures.Add($"棒号缺失（1..{max}）：{string.Join(", ", missing.Select(x => "第" + x + "棒"))}");
+                result.AssertionFailures.Add(
+                    $"棒号缺失（{(lo == 1 ? "1" : $"第{lo}棒")}..第{hi}棒之间）："
+                    + string.Join(", ", missing.Select(x => "第" + x + "棒")));
+
+            if (missingBarsOnlyWithinKnownRange)
+                result.Warnings.Add($"单链接模式：只覆盖第 {min}–{max} 棒，两端之外的棒次未被采集，不计为缺失");
         }
 
         // ---------- 与接口声称的动态数对照（信息性，不硬失败） ----------
