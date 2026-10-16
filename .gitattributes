@@ -1,0 +1,10 @@
+# 统一换行符，避免 CRLF 警告与 diff 噪声
+* text=auto eol=lf
+
+# 夹具是二进制/带 MIME 结构的归档页，禁止任何行尾转换
+*.mhtml binary
+*.mht   binary
+
+# 规范产物：UTF-8 带 BOM 的 CSV
+*.csv text eol=lf
+*.md  text eol=lf

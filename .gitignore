@@ -1,0 +1,26 @@
+# ---- 只版本化"代码 + 夹具"，不版本化任何过程产物与构建输出 ----
+# 抓取原始响应 / 缓存 / 审计 JSONL / 只读报告
+work/
+
+# 本地 dotnet CLI home（模板引擎缓存等，因沙箱需要重定向到工作区）
+.dotnet/
+
+# 构建与发布产物
+bin/
+obj/
+publish/
+*.user
+*.suo
+
+# 浏览器持久化 profile（当前方案不装 Playwright，仍按约定排除）
+.browser-profile/
+
+# Excel 便利副本（规范产物是 UTF-8+BOM 的 .csv）
+*.excel.csv
+
+# 编辑器 / 系统
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
