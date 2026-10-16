@@ -43,12 +43,23 @@ public static class SummaryExtractor
         @"圆满结束|收获了|感谢各位|感谢你们|活动平台|回顾这场|全部作者|本届|名册|节目单",
         RegexOptions.Compiled);
 
-    /// <summary>判定一张卡片是否为"总结/名册"卡：命中特征词且能抽出 ≥4 个棒位。</summary>
+    /// <summary>
+    /// 判定一张卡片是否为"总结/名册"卡：
+    ///   ① 命中特征词（圆满结束/感谢各位…）且能抽出 ≥4 个棒位；或
+    ///   ② 正文里罗列了 ≥6 个不同棒号（实测 topic 1101507 的总结卡没有任何特征词，
+    ///      只是一口气写了「第一棒0:00@A … 第二棒1:00@B …」，靠棒号密度才能认出来）。
+    /// </summary>
     public static bool IsSummaryCard(TopicCard card, out List<RosterSlot> slots)
     {
         slots = ExtractSlots(card.MergedText ?? string.Empty);
-        if (slots.Count < 4) return false;
-        return SummaryKeywordRegex.IsMatch(card.MergedText ?? string.Empty);
+        var text = card.MergedText ?? string.Empty;
+        if (slots.Count >= 4 && SummaryKeywordRegex.IsMatch(text)) return true;
+
+        var barNumbers = Regex.Matches(text, @"第\s*([0-9]{1,3}|[零〇○一二两三四五六七八九十]{1,4})\s*棒")
+                              .Select(m => m.Groups[1].Value)
+                              .Distinct()
+                              .Count();
+        return barNumbers >= 6;
     }
 
     /// <summary>从文本里抽出所有「时段 |@创作者」，并尽量把紧随其后的作品链接绑上去。</summary>
@@ -139,10 +150,15 @@ public static class SummaryExtractor
         }
         if (counts.Count == 0) return null;
 
-        // 覆盖率优先：只有覆盖大部分卡片的标签才是"本活动的标签"。
-        // 实测教训：topic 1343535 里最频繁的是 #因幡帝#（10/34），
-        // 而完整话题名 #「百变因幡帝」10.1帝之日创作接力# 覆盖 33/34 —— 取最频繁的那个是错的。
-        int minCoverage = Math.Max(2, (int)Math.Ceiling(cardList.Count * 0.5));
+        // 覆盖率优先：只有覆盖大部分"带标签卡片"的标签才是本活动的标签。
+        // 实测教训：① topic 1343535 里最频繁的是 #因幡帝#（10/34），
+        //             而完整话题名 #「百变因幡帝」10.1帝之日创作接力# 覆盖 33/34；
+        //           ② topic 1348289 的完整标签只覆盖 15/36 张卡片（参与者的帖子里常省略），
+        //             所以分母取"带标签的卡片数"而不是全部卡片，否则会漏掉正确标签。
+        int withAnyTag = cardList.Count(c => !string.IsNullOrEmpty(c.MergedText)
+                                             && Regex.IsMatch(c.MergedText, @"#[^#\s]{2,40}#"));
+        int basis = Math.Max(2, withAnyTag > 0 ? withAnyTag : cardList.Count);
+        int minCoverage = Math.Max(2, (int)Math.Ceiling(basis * 0.4));
         var viable = counts.Where(kv => kv.Value >= minCoverage).ToList();
         if (viable.Count == 0) viable = counts.OrderByDescending(kv => kv.Value).Take(1).ToList();
 
@@ -167,9 +183,18 @@ public static class SummaryExtractor
             .First().Key;
     }
 
-    /// <summary>「HH:MM@名字」或「HH:MM |@名字」——正文里声明时段与创作者的另一种写法。</summary>
+    /// <summary>
+    /// 逐棒（**单行**）的「HH:MM [修饰词] | @名字」——topic 1348289 每根棒的真实写法。
+    /// 关键：who 字符类里**必须排除 \n**。早期版本漏了它，正则跨行匹配后被"跨行守卫"整体拒掉，
+    /// 结果 36 张卡片一条都没解析出时段（表现为 25 条"未归属"）。
+    /// </summary>
+    private static readonly Regex LineTimeAtNameRegex = new(
+        @"(?<![\d:])(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?<q>[^\s|｜丨@0-9\n]{0,6})\s*[|｜丨]\s*@\s*(?<who>[^\s@<（(、,，|｜\n]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>多行式（总结名册）：允许修饰词跨到下一行前，供 SummaryExtractor 专门抽取。</summary>
     private static readonly Regex TimeAtNameRegex = new(
-        @"(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?<q>[^\s|｜丨@0-9]{0,2}?)\s*[|｜丨]?\s*@\s*(?<who>[^\s@<（(、,，|｜]{1,30})",
+        @"(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?<q>[^|｜丨@\n]{0,10}?)\s*[|｜丨]\s*@\s*(?<who>[^\s@<（(、,，|｜\n]{1,30})",
         RegexOptions.Compiled);
 
     /// <summary>
@@ -178,9 +203,12 @@ public static class SummaryExtractor
     ///   【凤栖白泽庭竹林组24h 11:00】         → 11:00
     ///   【凤栖白泽庭竹林组24h-7:00】          → 7:00
     ///   【凤栖白泽庭竹林组24h·应援棒18:30】    → 18:30（时间在修饰词之后）
+    /// 关键约束：时间必须**紧跟分隔符**（空格/·/-/：）出现。
+    /// 早期版本用了 `\s*`，导致「24h·16：00」里的 `24` 被当成 24:00，
+    /// 又因为 "h" 后面没有紧跟 '】' 而整体匹配失败 → 该棒拿不到时段。
     /// </summary>
     private static readonly Regex TitleTimeRegex = new(
-        @"(?<!\d)(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?<q>[^0-9】]{0,8})?】",
+        @"(?<![\d:])(?<sep>[ \u00b7·\-—–_|｜:：])(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?<q>[^0-9】]{0,8})?】",
         RegexOptions.Compiled);
 
     /// <summary>"本作为代发，画师：X" / "本作为代发，作者@X" —— 明示代发且给出原作者。</summary>
@@ -238,15 +266,24 @@ public static class SummaryExtractor
             return true;
         }
 
-        // 3) 「HH:MM@名字」写法
-        //    关键守卫：匹配区间内若含换行，说明这是"总结名册"的一段（那个由 SummaryExtractor 专门处理），
-        //    否则名册卡会被当成"第1棒"，导致后续每根棒的棒号整体 +1（实测 topic 1348289 曾因此棒号全错）。
-        var m = TimeAtNameRegex.Match(text);
-        if (m.Success && m.Groups["h"].Value.Length <= 2 && !m.Value.Contains('\n'))
+        // 3) 逐棒的「HH:MM [修饰词] | @名字」（单行，who 里不含换行）
+        var line = LineTimeAtNameRegex.Match(text);
+        if (line.Success && line.Groups["h"].Value.Length <= 2)
         {
-            time ??= TextNormalizer.NormalizeTime(m.Groups["h"].Value, m.Groups["m"].Value);
-            if (qualifier is null && m.Groups["q"].Success) qualifier = m.Groups["q"].Value.Trim();
-            creator ??= TextNormalizer.CleanMention(m.Groups["who"].Value);
+            time ??= TextNormalizer.NormalizeTime(line.Groups["h"].Value, line.Groups["m"].Value);
+            if (qualifier is null && line.Groups["q"].Success) qualifier = line.Groups["q"].Value.Trim();
+            creator ??= TextNormalizer.CleanMention(line.Groups["who"].Value);
+        }
+
+        // 3b) 兜底：多行式（总结名册里的一行），仍要求匹配片段内不含换行
+        if (time is null)
+        {
+            var m = TimeAtNameRegex.Match(text);
+            if (m.Success && m.Groups["h"].Value.Length <= 2 && !m.Value.Contains('\n'))
+            {
+                time = TextNormalizer.NormalizeTime(m.Groups["h"].Value, m.Groups["m"].Value);
+                creator ??= TextNormalizer.CleanMention(m.Groups["who"].Value);
+            }
         }
 
         // 4) 明示代发的原作者署名

@@ -35,10 +35,36 @@ public static class BarParser
         @"(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*点?\s*棒", RegexOptions.Compiled);
 
     private static readonly Regex WhoRegex = new(
-        $@"第\s*(?:{NumPat})\s*棒[\s|｜丨:：]*(?:[0-9]{{1,2}}\s*[:：]\s*[0-9]{{2}})?\s*[|｜丨]?\s*"
+        $@"第\s*(?:{NumPat})\s*棒(?<tail>[^\n]{{0,24}}?)"
         + @"(?<!感谢\s*[:：]?\s*)(?<!鸣谢\s*[:：]?\s*)(?<!来自\s*[:：]?\s*)(?<!画师\s*[:：]?\s*)"
         + @"(?<!作者\s*[:：]?\s*)(?<!由\s*[:：]?\s*)(?<!协力\s*[:：]?\s*)(?<!帮忙\s*[:：]?\s*)"
-        + @"@\s*(?<who>[^\s@<（(、,，|｜]{1,30})",
+        + @"@\s*(?<who>[^\s@<（(、,，|｜\n]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// 声明的创作者**没有被正确 @ 出来**（B站不会渲染成 &lt;a&gt; 标签）。
+    /// 写法：「第18棒 19:00 作者：条（咖方代发）」「第一棒0:00可燃冰块」。
+    /// 按用户要求归为异常，交人工处理。
+    /// </summary>
+    private static readonly Regex WhoUnlinkedRegex = new(
+        $@"第\s*(?:{NumPat})\s*棒[^\n]{{0,24}}?(?:作者|画师|绘师|creator)\s*[:：]\s*(?<who>[^\s（(、,，|｜\n]{{1,30}})",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// 紧随棒号、未被 @ 的裸名字（如「第一棒0:00可燃冰块」）。
+    /// who 里排除 代发/作者/画师 等尾注词。
+    /// </summary>
+    private static readonly Regex WhoBareAfterTimeRegex = new(
+        $@"第\s*(?:{NumPat})\s*棒\s*[|｜丨:：]?\s*(?<h>[0-9]{{1,2}})\s*[:：]\s*(?<m>[0-9]{{2}})\s*(?<who>[^\s@<（(、,，|｜\n]{{2,30}})",
+        RegexOptions.Compiled);
+
+    /// <summary>出现"上一棒/下一棒"字样、但后面既没有 @ 也没有可识别名字。</summary>
+    private static readonly Regex NeighborPerspectiveRegex = new(
+        @"(?:上一棒|下一棒|前一棒|后一棒)\s*(?<tail>[^\n]{0,20})", RegexOptions.Compiled);
+
+    /// <summary>"X（Y代发）" —— 实测 topic 1101507：「第18棒 19:00 @C1cada_3301 （咖方代发）」「作者：条（咖方代发）」。</summary>
+    private static readonly Regex ProxyForCurrentRegex = new(
+        @"(?<orig>[^\s@<（(、,，|｜\n]{1,30})\s*[（(]\s*@?\s*(?<proxy>[^\s@（()）、,，\n]{1,20})\s*代(?:发|投|发布)",
         RegexOptions.Compiled);
 
     /// <summary>
@@ -80,6 +106,7 @@ public static class BarParser
         };
 
         var text = TextNormalizer.Normalize(card.MergedText ?? string.Empty);
+        bar.MergedText = text;
         bar.HasTopicTag = !string.IsNullOrEmpty(topicTag) && text.Contains(topicTag, StringComparison.Ordinal);
         if (string.IsNullOrWhiteSpace(text))
         {
@@ -137,9 +164,38 @@ public static class BarParser
             }
         }
 
-        // ---- 正文里的创作者 ----
+        // ---- 正文里的创作者（先试 @ 形式，再试"作者：X"与裸名字兜底） ----
         var who = WhoRegex.Match(text);
-        if (who.Success) bar.CreatorInText = TextNormalizer.CleanMention(who.Groups["who"].Value);
+        if (who.Success)
+            bar.CreatorInText = TextNormalizer.CleanMention(who.Groups["who"].Value);
+        else
+        {
+            var unlinked = WhoUnlinkedRegex.Match(text);
+            if (unlinked.Success)
+                bar.UnlinkedCreator = TextNormalizer.CleanMention(unlinked.Groups["who"].Value);
+            else
+            {
+                var bare = WhoBareAfterTimeRegex.Match(text);
+                if (bare.Success)
+                {
+                    var cand = TextNormalizer.CleanMention(bare.Groups["who"].Value);
+                    if (cand.Length >= 2 && !cand.Contains('棒') && !cand.Contains("代发") && !cand.Contains("作者"))
+                        bar.UnlinkedCreator = cand;
+                }
+            }
+            if (bar.UnlinkedCreator is { Length: > 0 })
+                bar.Conflicts.Add($"异常：创作者「{bar.UnlinkedCreator}」没有被正确 @ 出来（B站不会渲染成链接），需人工处理");
+        }
+
+        // ---- 本条的代发标注：「@原作者（某某代发）」 ----
+        var proxyForCurrent = ProxyForCurrentRegex.Match(text);
+        if (proxyForCurrent.Success)
+        {
+            bar.HasProxyAnnotation = true;
+            bar.ProxyName = TextNormalizer.CleanMention(proxyForCurrent.Groups["proxy"].Value);
+            var orig = TextNormalizer.CleanMention(proxyForCurrent.Groups["orig"].Value);
+            if (orig.Length >= 1 && !orig.Contains('棒')) bar.CreatorInText = orig;
+        }
 
         // ---- 上下棒（去掉包裹的方括号，实测有 "[めんどう15]" 这种写法） ----
         var prev = PrevRegex.Match(text);

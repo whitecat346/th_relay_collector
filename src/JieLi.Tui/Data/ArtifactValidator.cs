@@ -81,7 +81,10 @@ public static class ArtifactValidator
         result.RosterCardId = rosterCard?.Id;
         result.RosterSlots = rosterSlots;
 
-        // 无棒号时：先用名册/时段把棒号反演出来（实测 1348289 的正文只有时段没有棒号）
+        // 无棒号时：先用名册反演（实测 1348289 的逐棒正文既没有棒号也没有时段，只能靠名册对齐）
+        AssignBarNumbersFromRoster(bars, rosterSlots);
+
+        // 仍无棒号时：退回"时段反演"（只对有时段的卡片有效）
         AssignBarNumbersByTime(bars, rosterSlots);
 
         // ---------- 第二遍：数据驱动的"发布者是否创作者" ----------
@@ -125,6 +128,19 @@ public static class ArtifactValidator
         foreach (var b in bars)
         {
             if (b.IsSummary) continue; // 总结/名册卡不参与逐条问题标注
+
+            // 上下棒定位：出现了"上一棒/下一棒"字样，却没有可识别的 @ 提及
+            // （用户要求：对方没有被正确 @ 出来 → 归为异常，交人工处理）
+            var markerCount = System.Text.RegularExpressions.Regex.Matches(
+                b.MergedText ?? string.Empty, @"(?:上一棒|下一棒|前一棒|后一棒)").Count;
+            var namedCount = (b.PrevName is { Length: > 0 } ? 1 : 0) + (b.NextName is { Length: > 0 } ? 1 : 0);
+            if (markerCount > 0 && namedCount < markerCount)
+                b.HasUnlinkedNeighbor = true;
+            if (markerCount == 0)
+                b.HasNoNeighborMarkers = true;
+
+            if (b.HasUnlinkedNeighbor)
+                b.Conflicts.Add("异常：标注了上一棒/下一棒但没有正确 @ 出对方，需人工补全");
 
             if (b.IsUnattributable)
                 b.Conflicts.Add(b.DeclaredTime is null
@@ -189,6 +205,107 @@ public static class ArtifactValidator
         // 无名册：不自动赋号（避免把无关投稿编号），只提示需要人工确认
         foreach (var b in candidates)
             b.Conflicts.Add($"未找到总结名册，且正文只有时段 {b.DeclaredTime} 没有棒号 —— 需人工确认棒号");
+    }
+
+    /// <summary>
+    /// 用**总结名册**反演棒号——ai_guild.md 的"收集方法优先级 1"。
+    /// 实测动机（topic 1348289）：逐棒正文里既没有"第N棒"也没有时段，
+    /// 只有「上一棒@A / 下一棒@B」，单卡无从判断自己是第几棒；
+    /// 而主办方的总结动态给出了完整的「时段 → 创作者 → 作品链接」列表。
+    /// 三级匹配：① 作品链接里的 opus id == 卡片 id（最可靠）；② 创作者昵称（唯一命中时）；③ 正文里出现该棒的时段。
+    /// </summary>
+    private static void AssignBarNumbersFromRoster(List<ParsedBar> bars, List<RosterSlot> roster)
+    {
+        if (roster.Count == 0) return;
+
+        var pending = bars.Where(b => b.BarNumber is null && !b.IsEx && !b.IsSummary).ToList();
+        if (pending.Count == 0) return;
+
+        // 已认领的名册槽位（一个棒位只能被一根棒认领，避免同人多帖造成重复编号）
+        var used = new HashSet<int>();
+
+        // 名册项编号（1-based，与名册顺序一致）
+        var slotByOpusId = new Dictionary<string, (int Num, RosterSlot Slot)>(StringComparer.Ordinal);
+        var slotsByName = new Dictionary<string, List<(int Num, RosterSlot Slot)>>(StringComparer.Ordinal);
+        for (int i = 0; i < roster.Count; i++)
+        {
+            var s = roster[i];
+            int num = i + 1;
+            var id = ExtractOpusId(s.WorkUrl);
+            if (id is not null) slotByOpusId.TryAdd(id, (num, s));
+            if (s.Creator.Length > 0)
+            {
+                if (!slotsByName.TryGetValue(s.Creator, out var list)) slotsByName[s.Creator] = list = new();
+                list.Add((num, s));
+            }
+        }
+
+        // ① 作品链接里的 opus id（最可靠）
+        foreach (var b in pending)
+        {
+            if (slotByOpusId.TryGetValue(b.CardId, out var hit) && !used.Contains(hit.Num))
+            {
+                MarkFromRoster(b, hit.Num, hit.Slot, "名册作品链接匹配");
+                used.Add(hit.Num);
+            }
+        }
+
+        // ② 创作者昵称唯一命中
+        foreach (var b in pending.Where(x => x.BarNumber is null))
+        {
+            var name = b.ResolvedAuthor ?? b.PosterName;
+            if (name.Length == 0) continue;
+            if (slotsByName.TryGetValue(name, out var list))
+            {
+                var free = list.FirstOrDefault(x => !used.Contains(x.Num));
+                if (free.Slot is not null && list.Count == 1)
+                {
+                    MarkFromRoster(b, free.Num, free.Slot, "名册创作者匹配");
+                    used.Add(free.Num);
+                }
+            }
+        }
+
+        // ③ 正文里出现该棒的时段（如视频标题里的「16：00」）
+        foreach (var b in pending.Where(x => x.BarNumber is null))
+        {
+            if (b.DeclaredTime is not { Length: > 0 }) continue;
+            var idx = roster.FindIndex(s => s.Time == b.DeclaredTime);
+            if (idx >= 0 && roster.Count(s => s.Time == b.DeclaredTime) == 1 && !used.Contains(idx + 1))
+            {
+                MarkFromRoster(b, idx + 1, roster[idx], "名册时段匹配");
+                used.Add(idx + 1);
+            }
+        }
+
+        // 仍未归属的：说明是同一人的重复投稿 / 名册未收录
+        foreach (var b in pending.Where(x => x.BarNumber is null))
+        {
+            var name = b.ResolvedAuthor ?? b.PosterName;
+            var sameNameSlots = slotsByName.TryGetValue(name, out var l) ? l.Count : 0;
+            if (sameNameSlots > 0)
+                b.Conflicts.Add($"该创作者在名册里有 {sameNameSlots} 个棒位，{name} 的这条动态无法确定属于哪一棒（疑似同人多帖或名册已收录另一条）");
+            else
+                b.Conflicts.Add("总结名册里没有该创作者的棒位（可能是陪跑/无关投稿，或名册未收录）");
+        }
+    }
+
+    private static void MarkFromRoster(ParsedBar bar, int num, RosterSlot slot, string how)
+    {
+        bar.BarNumber = num;
+        bar.MatchedStyle ??= how;
+        if (bar.DeclaredTime is null) bar.DeclaredTime = slot.Time;
+        bar.Notes.Add($"{how}：总结名册第 {num} 项（{slot.Time}{(slot.Qualifier.Length > 0 ? " " + slot.Qualifier : "")}）");
+        if (bar.CreatorInText is null && slot.Creator.Length > 0) bar.CreatorInText = slot.Creator;
+    }
+
+    /// <summary>从作品链接里取出 opus id（用于与卡片 id 对齐）。</summary>
+    private static string? ExtractOpusId(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return null;
+        var m = System.Text.RegularExpressions.Regex.Match(url, @"/(?:opus|video|read)/([A-Za-z0-9]{6,})");
+        if (!m.Success) return null;
+        return m.Groups[1].Value;
     }
 
     public static int TimeToMinutes(string hhmm)

@@ -135,6 +135,24 @@ public sealed class ParsedBar
     /// <summary>该卡片是否为活动的总结/名册动态（不是一根棒）。</summary>
     public bool IsSummary { get; set; }
 
+    /// <summary>声明的创作者没有被正确 @ 出来（B站不渲染成 &lt;a&gt;），需人工处理。</summary>
+    public string? UnlinkedCreator { get; set; }
+    /// <summary>出现了"上一棒/下一棒"字样但没有可识别的 @ 提及（对方未正确 @ 出），需人工处理。</summary>
+    public bool HasUnlinkedNeighbor { get; set; }
+    /// <summary>本条既没有"上一棒"也没有"下一棒"，无法参与链路校验。</summary>
+    public bool HasNoNeighborMarkers { get; set; }
+    /// <summary>本条是否为代发的原作者归属（有"（某某代发）"标注）。</summary>
+    public bool HasProxyAnnotation { get; set; }
+
+    /// <summary>本条的原始合并正文（用于异常判定与人工核对）。</summary>
+    public string MergedText { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 棒数异常：经过各种方法仍无法确定棒号，按用户要求**按时间排序**处理。
+    /// 这类条目很常见，不属于"无法归属"（无法归属是连归属都可能错的更严重情况）。
+    /// </summary>
+    public bool IsBarNumberUnknown => BarNumber is null && !IsEx && !IsSummary;
+
     public List<string> Conflicts { get; } = new();
     public List<string> Notes { get; } = new();
 
