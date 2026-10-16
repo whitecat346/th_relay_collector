@@ -1,0 +1,256 @@
+#nullable enable
+using System.Text.RegularExpressions;
+using JieLi.Tui.Model;
+
+namespace JieLi.Tui.Data;
+
+/// <summary>从总结动态里抽出的一个棒位。</summary>
+public sealed class RosterSlot
+{
+    /// <summary>时段，如 "0:00"、"5:20"。</summary>
+    public string Time { get; set; } = string.Empty;
+    /// <summary>时段后的修饰词，如 "特殊棒"、"应援棒"；普通整点棒为空。</summary>
+    public string Qualifier { get; set; } = string.Empty;
+    public string Creator { get; set; } = string.Empty;
+    public string WorkUrl { get; set; } = string.Empty;
+
+    public bool IsSpecial => Qualifier.Length > 0;
+}
+
+/// <summary>
+/// 总结动态解析器 —— 对应 ai_guild.md 里"收集方法优先级 1：根据 tag 中包含的总结专栏得到全部信息"。
+///
+/// 实测两套格式：
+///   ① 逐行式（topic 1348289 的主办总结）：
+///        0:00 |@御宫樱寻喵
+///        https://www.bilibili.com/opus/1251670295345889287?spm_id_from=...
+///        5:20特殊棒 |@鴉CORVUS
+///        7:00 |@少鹅e
+///   ② 清单式（topic 1343333 的总结专栏）：正文里逐段列 "第N棒 HH:MM 创作者"
+///
+/// 逐行式是**优先级最高的数据源**：它是主办方自己发布的完整名册，
+/// 一次请求就能拿到「时段 → 创作者 → 作品链接」的直接映射，比逐棒猜正文可靠得多。
+/// </summary>
+public static class SummaryExtractor
+{
+    /// <summary>「HH:MM 修饰词? |@名字」——总结名册的一行。</summary>
+    private static readonly Regex SlotRegex = new(
+        @"(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?<q>[^\s|｜丨@]{0,8}?)\s*[|｜丨]\s*@\s*(?<who>[^\s@<（(、,，|｜\r\n]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>总结动态的特征词。</summary>
+    private static readonly Regex SummaryKeywordRegex = new(
+        @"圆满结束|收获了|感谢各位|感谢你们|活动平台|回顾这场|全部作者|本届|名册|节目单",
+        RegexOptions.Compiled);
+
+    /// <summary>判定一张卡片是否为"总结/名册"卡：命中特征词且能抽出 ≥4 个棒位。</summary>
+    public static bool IsSummaryCard(TopicCard card, out List<RosterSlot> slots)
+    {
+        slots = ExtractSlots(card.MergedText ?? string.Empty);
+        if (slots.Count < 4) return false;
+        return SummaryKeywordRegex.IsMatch(card.MergedText ?? string.Empty);
+    }
+
+    /// <summary>从文本里抽出所有「时段 |@创作者」，并尽量把紧随其后的作品链接绑上去。</summary>
+    public static List<RosterSlot> ExtractSlots(string text)
+    {
+        var slots = new List<RosterSlot>();
+        if (string.IsNullOrWhiteSpace(text)) return slots;
+
+        text = TextNormalizer.Normalize(text);
+        var matches = SlotRegex.Matches(text);
+        for (int i = 0; i < matches.Count; i++)
+        {
+            var m = matches[i];
+            var slot = new RosterSlot
+            {
+                Time = TextNormalizer.NormalizeTime(m.Groups["h"].Value, m.Groups["m"].Value),
+                Qualifier = m.Groups["q"].Value.Trim(),
+                Creator = TextNormalizer.CleanMention(m.Groups["who"].Value),
+            };
+
+            // 该棒位之后、下一个棒位之前，若出现一条 B站链接，视为该棒的作品链接
+            int start = m.Index + m.Length;
+            int end = i + 1 < matches.Count ? matches[i + 1].Index : text.Length;
+            if (end > start)
+            {
+                var segment = text[start..Math.Min(end, start + 400)];
+                var link = Regex.Match(segment, @"https?://(?:www\.)?(?:bilibili\.com/(?:opus|video|read)/[^\s\)]+|t\.bilibili\.com/[^\s\)]+)");
+                if (link.Success) slot.WorkUrl = link.Value.TrimEnd('?', '&');
+            }
+
+            slots.Add(slot);
+        }
+        return slots;
+    }
+
+    /// <summary>
+    /// 全卡片扫描：找出总结卡，返回其名册。
+    /// 若存在多张候选，取棒位数最多的那张。
+    /// </summary>
+    public static (TopicCard? Card, List<RosterSlot> Slots) FindRoster(IEnumerable<TopicCard> cards)
+    {
+        TopicCard? best = null;
+        var bestSlots = new List<RosterSlot>();
+
+        foreach (var c in cards)
+        {
+            if (IsSummaryCard(c, out var slots) && slots.Count > bestSlots.Count)
+            {
+                best = c;
+                bestSlots = slots;
+            }
+        }
+        return (best, bestSlots);
+    }
+
+    /// <summary>按时段去重合并多个名册（同一时段只保留第一个）。</summary>
+    public static List<RosterSlot> Merge(IEnumerable<RosterSlot> slots)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var result = new List<RosterSlot>();
+        foreach (var s in slots)
+            if (seen.Add(s.Time + "|" + s.Qualifier))
+                result.Add(s);
+        return result;
+    }
+
+    /// <summary>
+    /// 推断"话题标签"：在所有卡片里找出现次数最多的 #……#。
+    /// 实测用途（topic 1348289）：该活动的棒次正文里**没有"第N棒"**，
+    /// 只在视频标题/正文里以「【凤栖白泽庭竹林组24h-7:00】」「上一棒6:00@Yummysan」出现时段，
+    /// 而 #凤栖白泽庭竹林组24h# 这个标签是判定"这条动态属于本接力"的最强信号（31/36 条带它）。
+    /// </summary>
+    public static string? InferTopicTag(IEnumerable<TopicCard> cards, string? topicName = null)
+    {
+        var cardList = cards.ToList();
+        if (cardList.Count == 0) return null;
+
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var c in cardList)
+        {
+            if (string.IsNullOrEmpty(c.MergedText)) continue;
+            foreach (Match m in Regex.Matches(c.MergedText, @"#([^#\s]{2,40})#"))
+            {
+                var tag = m.Groups[1].Value.Trim();
+                if (tag.Length < 2) continue;
+                counts[tag] = counts.GetValueOrDefault(tag) + 1;
+            }
+        }
+        if (counts.Count == 0) return null;
+
+        // 覆盖率优先：只有覆盖大部分卡片的标签才是"本活动的标签"。
+        // 实测教训：topic 1343535 里最频繁的是 #因幡帝#（10/34），
+        // 而完整话题名 #「百变因幡帝」10.1帝之日创作接力# 覆盖 33/34 —— 取最频繁的那个是错的。
+        int minCoverage = Math.Max(2, (int)Math.Ceiling(cardList.Count * 0.5));
+        var viable = counts.Where(kv => kv.Value >= minCoverage).ToList();
+        if (viable.Count == 0) viable = counts.OrderByDescending(kv => kv.Value).Take(1).ToList();
+
+        string? Overlap(string tag)
+        {
+            if (string.IsNullOrWhiteSpace(topicName)) return null;
+            string best = string.Empty;
+            for (int i = 0; i < tag.Length; i++)
+                for (int j = i + 2; j <= tag.Length; j++)
+                {
+                    var sub = tag[i..j];
+                    if (sub.Length > best.Length && topicName.Contains(sub, StringComparison.Ordinal))
+                        best = sub;
+                }
+            return best.Length >= 2 ? best : null;
+        }
+
+        return viable
+            .OrderByDescending(kv => Overlap(kv.Key)?.Length ?? 0)
+            .ThenByDescending(kv => kv.Key.Length)
+            .ThenByDescending(kv => kv.Value)
+            .First().Key;
+    }
+
+    /// <summary>「HH:MM@名字」或「HH:MM |@名字」——正文里声明时段与创作者的另一种写法。</summary>
+    private static readonly Regex TimeAtNameRegex = new(
+        @"(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?<q>[^\s|｜丨@0-9]{0,2}?)\s*[|｜丨]?\s*@\s*(?<who>[^\s@<（(、,，|｜]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// 视频标题里的时段（实测三种写法，且时间后面可能还跟修饰词）：
+    ///   【凤栖白泽庭竹林组24h·16：00】        → 16:00
+    ///   【凤栖白泽庭竹林组24h 11:00】         → 11:00
+    ///   【凤栖白泽庭竹林组24h-7:00】          → 7:00
+    ///   【凤栖白泽庭竹林组24h·应援棒18:30】    → 18:30（时间在修饰词之后）
+    /// </summary>
+    private static readonly Regex TitleTimeRegex = new(
+        @"(?<!\d)(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?<q>[^0-9】]{0,8})?】",
+        RegexOptions.Compiled);
+
+    /// <summary>"本作为代发，画师：X" / "本作为代发，作者@X" —— 明示代发且给出原作者。</summary>
+    private static readonly Regex ProxyCreditRegex = new(
+        @"本作(?:为|是)?代发[，,、\s]*(?:画师|作者|绘师)\s*[:：]?\s*@?\s*(?<who>[^\s@<（(、,，|｜\r\n]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>"HH:MM点棒：@X" —— 时段在前、创作者在后的写法（topic 1343535 的第29棒）。</summary>
+    private static readonly Regex PointBarWhoRegex = new(
+        @"(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*点棒\s*[：:]?\s*@\s*(?<who>[^\s@<（(、,，|｜]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// 无"第N棒"格式时的补充解析：从正文/标题里取「时段 + 创作者」。
+    /// 返回 true 表示找到时段；creator 可能为空（需再用邻居指认补）。
+    /// </summary>
+    public static bool TryParseTimeAndCreator(string mergedText, bool hasTopicTag, out string? time, out string? qualifier, out string? creator)
+        => TryParseTimeAndCreator(mergedText, null, hasTopicTag, out time, out qualifier, out creator);
+
+    /// <summary>
+    /// 带字段区分版本的解析：<paramref name="titleText"/> 只由标题类字段拼成。
+    /// 必须区分的原因：视频的 duration_text（"01:58"）混进整段文本后会被标题时间正则误当成棒次时间。
+    /// </summary>
+    public static bool TryParseTimeAndCreator(
+        string mergedText,
+        string? titleText,
+        bool hasTopicTag,
+        out string? time,
+        out string? qualifier,
+        out string? creator)
+    {
+        time = null; qualifier = null; creator = null;
+        if (string.IsNullOrWhiteSpace(mergedText) && string.IsNullOrWhiteSpace(titleText)) return false;
+
+        var text = TextNormalizer.Normalize(mergedText);
+        var title = TextNormalizer.Normalize(titleText ?? string.Empty);
+
+        // 1) 标题里的「HH:MM】」最可靠（时间由作者写在标题里）
+        if (hasTopicTag && title.Length > 0)
+        {
+            var t = TitleTimeRegex.Match(title);
+            if (t.Success)
+            {
+                time = TextNormalizer.NormalizeTime(t.Groups["h"].Value, t.Groups["m"].Value);
+                if (t.Groups["q"].Success) qualifier = t.Groups["q"].Value.Trim();
+            }
+        }
+
+        // 2) 「HH:MM点棒：@X」写法
+        var pb = PointBarWhoRegex.Match(text);
+        if (pb.Success)
+        {
+            time ??= TextNormalizer.NormalizeTime(pb.Groups["h"].Value, pb.Groups["m"].Value);
+            creator = TextNormalizer.CleanMention(pb.Groups["who"].Value);
+            return true;
+        }
+
+        // 3) 「HH:MM@名字」写法
+        var m = TimeAtNameRegex.Match(text);
+        if (m.Success && m.Groups["h"].Value.Length <= 2)
+        {
+            time ??= TextNormalizer.NormalizeTime(m.Groups["h"].Value, m.Groups["m"].Value);
+            if (qualifier is null && m.Groups["q"].Success) qualifier = m.Groups["q"].Value.Trim();
+            creator ??= TextNormalizer.CleanMention(m.Groups["who"].Value);
+        }
+
+        // 4) 明示代发的原作者署名
+        var pc = ProxyCreditRegex.Match(text);
+        if (pc.Success) creator = TextNormalizer.CleanMention(pc.Groups["who"].Value);
+
+        return time is not null || creator is not null;
+    }
+}

@@ -1,0 +1,362 @@
+#nullable enable
+using JieLi.Tui.Model;
+
+namespace JieLi.Tui.Data;
+
+/// <summary>一次交叉校验的结果。</summary>
+public sealed class ValidationResult
+{
+    public List<ParsedBar> Bars { get; init; } = new();
+    public List<string> AssertionFailures { get; init; } = new();
+    public List<string> Warnings { get; init; } = new();
+
+    /// <summary>总结/名册动态的卡片 id（若找到）。</summary>
+    public string? RosterCardId { get; set; }
+    public List<RosterSlot> RosterSlots { get; set; } = new();
+
+    public int Attributed => Bars.Count(b => b.BarNumber.HasValue || b.IsEx);
+    public int Unattributable => Bars.Count(b => b.IsUnattributable);
+    public int ConflictCount => Bars.Count(b => b.Conflicts.Count > 0);
+    public int ProxyCount => Bars.Count(b => b.IsProxy);
+    public int MaxBar => Bars.Where(b => b.BarNumber.HasValue).Select(b => b.BarNumber!.Value).DefaultIfEmpty(0).Max();
+}
+
+/// <summary>
+/// M3 交叉校验器。三路"证据"的含义（设计阶段确定的口径）：
+///   ① 卡片结构化多字段（desc.text / major.*.desc / major.*.title）—— 字段与正文来源（主）
+///   ② 单棒页面 DOM 解析（人工保存的页面兜底）—— 字段的备份来源
+///   ③ at 链图遍历 —— 独立复核"棒序对不对"（只提供第二个意见，不提供字段）
+/// 断言口径：
+///   - 卡片数 == 接口 dynamics → 硬失败（在采集层断言1）
+///   - 棒号在 1..实际最高棒 上无缺失、无重复 → 硬失败（本类断言2）
+///     ⚠ 不能用 dynamics 当上限：实测 dynamics=34 而最高棒号=30（差额是视频投稿/无关投稿），
+///       拿 34 当上限会误报"缺第31~34棒"。
+///   - 发布时刻与声明时段偏差 → 仅警告（实测存在发布延迟 193 分钟的正当反例）
+/// </summary>
+public static class ArtifactValidator
+{
+    /// <summary>偏差阈值（分钟）：超过则进"可疑"清单，但不阻断。</summary>
+    public const int DeviationWarnMinutes = 120;
+
+    /// <summary>
+    /// 组织号判定阈值：同一个账号有 ≥N 次"正文标注的创作者 ≠ 自己"，
+    /// 就认为它是代发型账号（主催号）。实测 沐南沐南沐南 mid=351852362 有 12 次。
+    /// 用数据驱动而不是硬编码 mid——换一个活动、换一个主催，逻辑依然成立。
+    /// </summary>
+    private const int OrganizerThreshold = 2;
+
+    public static ValidationResult Validate(IEnumerable<TopicCard> cards, int? dynamicsReported = null, string? topicName = null)
+    {
+        var result = new ValidationResult();
+        var cardList = cards.ToList();
+
+        // 先推断话题标签：它是"这条动态属于本接力"的最强信号，供无"第N棒"格式的活动使用
+        var tag = SummaryExtractor.InferTopicTag(cardList, topicName);
+
+        foreach (var card in cardList)
+        {
+            var bar = BarParser.Parse(card, tag);
+            BarParser.ComputeDeviation(bar);
+            result.Bars.Add(bar);
+        }
+        var bars = result.Bars;
+
+        // 名册（总结动态）：ai_guild.md 的"收集方法优先级 1"，用于校验棒号与时段
+        var (rosterCard, rosterSlots) = SummaryExtractor.FindRoster(cardList);
+        result.RosterCardId = rosterCard?.Id;
+        result.RosterSlots = rosterSlots;
+
+        // 无棒号时：先用名册/时段把棒号反演出来（实测 1348289 的正文只有时段没有棒号）
+        AssignBarNumbersByTime(bars, rosterSlots);
+
+        // ---------- 第二遍：数据驱动的"发布者是否创作者" ----------
+        ApplyProxyHeuristic(bars);
+
+        // ---------- 断言 2：棒号完整性（上限 = 实际最高棒号） ----------
+        var numbered = bars.Where(b => b.BarNumber.HasValue).ToList();
+        var dups = numbered.GroupBy(b => b.BarNumber!.Value).Where(g => g.Count() > 1)
+                           .Select(g => g.Key).OrderBy(x => x).ToList();
+        if (dups.Count > 0)
+            result.AssertionFailures.Add($"棒号重复：{string.Join(", ", dups.Select(x => "第" + x + "棒"))}");
+
+        if (numbered.Count == 0)
+        {
+            if (bars.Count > 0) result.AssertionFailures.Add("没有任何卡片解析出棒号");
+        }
+        else
+        {
+            int max = numbered.Max(b => b.BarNumber!.Value);
+            var missing = Enumerable.Range(1, max).Where(i => !numbered.Any(b => b.BarNumber == i)).ToList();
+            if (missing.Count > 0)
+                result.AssertionFailures.Add($"棒号缺失（1..{max}）：{string.Join(", ", missing.Select(x => "第" + x + "棒"))}");
+        }
+
+        // ---------- 与接口声称的动态数对照（信息性，不硬失败） ----------
+        if (dynamicsReported is { } dyn && dyn > 0)
+        {
+            int explained = bars.Count(b => b.BarNumber.HasValue || b.IsEx);
+            int unnumbered = bars.Count - explained;
+            if (dyn != bars.Count)
+                result.Warnings.Add($"卡片数({bars.Count}) ≠ 接口声称的 dynamics({dyn})");
+            if (unnumbered > 0)
+                result.Warnings.Add($"有 {unnumbered} 条卡片没有棒号（未编号的投稿/无关内容），"
+                                    + $"与最高棒号 {result.MaxBar} 一起解释了 dynamics({dyn}) 中的差额");
+        }
+
+        // ---------- ③ at 链图遍历复核 ----------
+        CrossCheckChain(bars, result.Warnings);
+
+        // ---------- 逐条标注问题 ----------
+        foreach (var b in bars)
+        {
+            if (b.IsUnattributable)
+                b.Conflicts.Add(b.DeclaredTime is null
+                    ? "无法归属：正文里找不到棒号（需人工保存页面兜底）"
+                    : $"无法归属：正文只有时段 {b.DeclaredTime}，没有棒号（需人工确认）");
+
+            if (b.TimeDeviationMinutes is { } dev && Math.Abs(dev) > DeviationWarnMinutes)
+                b.Notes.Add($"发布时刻与声明时段差 {dev} 分钟（超过 ±{DeviationWarnMinutes} 分钟阈值）");
+
+            if (b.DeclaredTime is null && (b.BarNumber.HasValue || b.IsEx))
+                b.Conflicts.Add("缺少声明时段");
+
+            if (b.PrevName is null && b.BarNumber is > 1)
+                b.Notes.Add("未标注上一棒");
+            if (b.NextName is null && b.BarNumber.HasValue && b.BarNumber != result.MaxBar)
+                b.Notes.Add("未标注下一棒");
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 无"第N棒"格式时，用**时段**反演棒号：
+    ///   ① 优先靠名册（总结动态）——名册顺序就是棒序，见 topic 1348289；
+    ///   ② 无名册则按唯一时段排序赋号，并标注低置信度。
+    /// 只在"本卡没有棒号"时生效，绝不覆盖正文里已写明的棒号。
+    /// </summary>
+    private static void AssignBarNumbersByTime(List<ParsedBar> bars, List<RosterSlot> roster)
+    {
+        // 只对"带本活动话题标签 + 有时段"的卡片做时段反演，否则会把无关投稿也编号
+        var candidates = bars.Where(b => b.BarNumber is null && !b.IsEx
+                                         && b.DeclaredTime is { Length: > 0 }
+                                         && (b.HasTopicTag || b.CreatorInText is { Length: > 0 }))
+                             .ToList();
+        if (candidates.Count == 0) return;
+
+        if (roster.Count > 0)
+        {
+            var byTime = new Dictionary<string, int>(StringComparer.Ordinal);
+            int n = 0;
+            foreach (var s in roster)
+            {
+                n++;
+                if (!byTime.ContainsKey(s.Time)) byTime[s.Time] = n;
+            }
+            foreach (var b in candidates)
+            {
+                if (byTime.TryGetValue(b.DeclaredTime!, out var num))
+                {
+                    b.BarNumber = num;
+                    b.MatchedStyle ??= "名册反演";
+                    b.Notes.Add($"正文未写棒号，按名册中同时段的位置反演为第{num}棒");
+                }
+                else
+                {
+                    b.Conflicts.Add($"时段 {b.DeclaredTime} 不在总结名册里，无法确定棒号");
+                }
+            }
+            return;
+        }
+
+        // 无名册：不自动赋号（避免把无关投稿编号），只提示需要人工确认
+        foreach (var b in candidates)
+            b.Conflicts.Add($"未找到总结名册，且正文只有时段 {b.DeclaredTime} 没有棒号 —— 需人工确认棒号");
+    }
+
+    public static int TimeToMinutes(string hhmm)
+    {
+        var parts = hhmm.Split(':');
+        if (parts.Length != 2) return int.MaxValue;
+        return (int.TryParse(parts[0], out var h) ? h : 0) * 60 + (int.TryParse(parts[1], out var m) ? m : 0);
+    }
+
+    /// <summary>
+    /// 第二遍：用"该账号代发了几次"来判断它是不是代发型账号（主催号），再回头修正每条的代发判定。
+    /// 动机（实测）：第25棒由 texas-engineer 发布，正文写 @texas_quality —— 这是同一个人改名，
+    /// 但第24棒的"下一棒"和第26棒的"上一棒"都把他称作 texas-engineer，说明他既是发布者也是创作者。
+    /// 若不加这层校正，会被误报成"代发"。
+    /// </summary>
+    private static void ApplyProxyHeuristic(List<ParsedBar> bars)
+    {
+        var ordered = bars.Where(b => b.BarNumber.HasValue)
+                          .OrderBy(b => b.BarNumber!.Value)
+                          .ToList();
+        var byNumber = ordered.GroupBy(b => b.BarNumber!.Value)
+                              .ToDictionary(g => g.Key, g => g.First());
+
+        // ---- 预扫描：正文没点名创作者时，用邻居的 at 指认来补（这是③链路校验反哺①字段） ----
+        foreach (var b in ordered)
+        {
+            if (b.CreatorInText is { Length: > 0 }) continue;
+            var inferred = InferCreatorFromNeighbors(byNumber, b.BarNumber!.Value);
+            if (inferred is { Length: > 0 } name)
+            {
+                b.CreatorInText = name;
+                b.Notes.Add($"正文未点名创作者，由相邻棒的 at 指认推断为 @{name}");
+            }
+        }
+
+        // ---- 统计：每个发布者有多少次"正文创作者 ≠ 自己" ----
+        var mismatchCount = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var b in bars)
+        {
+            if (b.CreatorInText is not { Length: > 0 } who) continue;
+            if (TextNormalizer.SameName(who, b.PosterName)) continue;
+            mismatchCount[b.PosterName] = mismatchCount.GetValueOrDefault(b.PosterName) + 1;
+        }
+
+        var organizers = mismatchCount.Where(kv => kv.Value >= OrganizerThreshold)
+                                      .Select(kv => kv.Key)
+                                      .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var b in bars)
+        {
+            bool posterIsOrganizer = organizers.Contains(b.PosterName);
+
+            if (posterIsOrganizer && b.CreatorInText is { Length: > 0 } who)
+            {
+                // 代发型账号发布 + 正文点名创作者 → 真代发
+                b.IsProxy = true;
+                b.ProxyName = b.PosterName;
+                b.ResolvedAuthor = who;   // 保留发布者空间链接（原作者 UID 未知）
+                if (!b.Notes.Any(n => n.StartsWith("代发：", StringComparison.Ordinal)))
+                    b.Notes.Add($"代发：发布者 @{b.PosterName}（代发型账号），正文标注创作者 @{who}（原作者 UID 未知）");
+            }
+            else
+            {
+                // 非代发型账号：发布者即创作者（实测 who 与 poster 不同多为改名，不是代发）
+                b.IsProxy = false;
+                b.ProxyName = null;
+                b.ResolvedAuthor = b.PosterName;
+                b.ResolvedAuthorLink = b.AuthorMid > 0 ? $"https://space.bilibili.com/{b.AuthorMid}" : string.Empty;
+                b.Notes.RemoveAll(n => n.StartsWith("代发：", StringComparison.Ordinal));
+                if (b.CreatorInText is { Length: > 0 } w && !TextNormalizer.SameName(w, b.PosterName))
+                    b.Notes.Add($"正文点名 @{w}，但该账号不是代发型账号 → 按发布者认定（可能是改名，原为「{w}」）");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 用邻居指认推断某棒的创作者：第 n-1 棒的"下一棒"与第 n+1 棒的"上一棒"应当都指向第 n 棒的人。
+    /// 实测：第21棒正文没点名创作者（写的是「にお/nio」无 @），
+    /// 但第20棒"下一棒：にお/nio"、第22棒"上一棒：にお" 一起把它指了出来。
+    /// </summary>
+    private static string? InferCreatorFromNeighbors(IReadOnlyDictionary<int, ParsedBar> byNumber, int num)
+    {
+        var candidates = new List<string>(2);
+        if (byNumber.TryGetValue(num - 1, out var prev) && prev.NextName is { Length: > 0 } pn) candidates.Add(pn);
+        if (byNumber.TryGetValue(num + 1, out var next) && next.PrevName is { Length: > 0 } nn) candidates.Add(nn);
+        if (candidates.Count == 0) return null;
+
+        // 多个候选：取最长的（"にお/nio" 优于 "にお"）；只看是否彼此一致（前缀关系即可）
+        if (candidates.Count == 1) return candidates[0];
+        return SameOrAlias(candidates[0], candidates[1])
+            ? candidates.OrderByDescending(c => c.Length).First()
+            : candidates[0];
+    }
+
+    /// <summary>
+    /// 用 at 链独立复核棒序：第 n 棒标注的"下一棒"应当等于第 n+1 棒解析出的创作者；
+    /// 反之"上一棒"应当等于第 n-1 棒的创作者。不一致只记警告
+    /// （创作者可改名，或标注本身写错——实测有 "にお" vs "にお/nio"、"myu" vs "myueo42" 这类简称差异）。
+    /// </summary>
+    private static void CrossCheckChain(List<ParsedBar> bars, List<string> warnings)
+    {
+        // ---- 先补"0:00 那一棒没写第N棒"的情况：第1棒标注的"上一棒"就是它 ----
+        PromoteUnnumberedZeroBar(bars);
+
+        var byNumber = bars.Where(b => b.BarNumber.HasValue)
+                           .GroupBy(b => b.BarNumber!.Value)
+                           .ToDictionary(g => g.Key, g => g.ToList());
+        int chainWarnings = 0;
+
+        foreach (var (num, list) in byNumber.OrderBy(kv => kv.Key))
+        {
+            if (list.Count != 1) continue; // 重复棒号已在断言里报过
+            var cur = list[0];
+
+            // 本棒标注的"下一棒" vs 下一棒的实际创作者
+            if (cur.NextName is { Length: > 0 } && byNumber.TryGetValue(num + 1, out var nexts) && nexts.Count == 1)
+            {
+                var nextCreator = CreatorOf(nexts[0]);
+                if (!SameOrAlias(cur.NextName, nextCreator))
+                    warnings.Add($"棒序复核：第{num}棒标注的下一棒「{cur.NextName}」≠ 第{num + 1}棒创作者「{nextCreator}」");
+            }
+
+            // 本棒标注的"上一棒" vs 上一棒的实际创作者
+            if (cur.PrevName is { Length: > 0 } && byNumber.TryGetValue(num - 1, out var prevs) && prevs.Count == 1)
+            {
+                var prevCreator = CreatorOf(prevs[0]);
+                if (!SameOrAlias(cur.PrevName, prevCreator))
+                    warnings.Add($"棒序复核：第{num}棒标注的上一棒「{cur.PrevName}」≠ 第{num - 1}棒创作者「{prevCreator}」");
+            }
+
+            if (++chainWarnings > 40) break;
+        }
+    }
+
+    /// <summary>
+    /// topic 1343535 的首棒正文只写「第1棒 | 00:00」而另一张 0:00 的卡片没写"第N棒"，
+    /// 于是"第1棒的上一棒"就把它指认出来了。这里把那种无编号、无上下棒的卡片补成第 0 棒。
+    /// </summary>
+    private static void PromoteUnnumberedZeroBar(List<ParsedBar> bars)
+    {
+        var first = bars.FirstOrDefault(b => b.BarNumber == 1 && b.PrevName is { Length: > 0 });
+        if (first is null) return;
+        var prevName = first.PrevName!;
+
+        if (bars.Any(b => b.BarNumber == 0)) return;
+
+        var phantom = bars.FirstOrDefault(b => b.BarNumber is null && !b.IsEx
+                                               && b.PrevName is null && b.NextName is null
+                                               && SameOrAlias(b.ResolvedAuthor ?? b.PosterName, prevName));
+        if (phantom is null) return;
+
+        phantom.BarNumber = 0;
+        phantom.MatchedStyle ??= "0:00 无编号(邻居推断)";
+        phantom.Notes.Add("正文没有「第N棒」，由第1棒的上一棒指认推断为第0棒");
+    }
+
+    /// <summary>
+    /// 取"这一棒的创作者"用于链路复核。
+    /// 注意优先级：非代发时以 ResolvedAuthor（= 发布者）为准——实测第25棒正文写 @texas_quality、
+    /// 但发布者与相邻棒的指认都是 texas-engineer（同一人改名），此时以发布者为准才对得上链。
+    /// </summary>
+    private static string CreatorOf(ParsedBar b)
+        => b.IsProxy && b.ResolvedAuthor is { Length: > 0 } r
+            ? r
+            : (b.ResolvedAuthor ?? b.CreatorInText ?? b.PosterName);
+
+    /// <summary>判定"看起来是同一个人的简写"：一方是另一方前缀，或去掉分隔符后互为前缀。</summary>
+    private static bool SameOrAlias(string a, string b)
+    {
+        if (TextNormalizer.SameName(a, b)) return true;
+
+        static string Key(string s)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var ch in TextNormalizer.CleanMention(s))
+            {
+                if (char.IsWhiteSpace(ch) || ch is '_' or '-' or '.' or '/') continue;
+                sb.Append(char.ToLowerInvariant(ch));
+            }
+            return sb.ToString();
+        }
+
+        var ka = Key(a);
+        var kb = Key(b);
+        if (ka.Length == 0 || kb.Length == 0) return false;
+        return ka.StartsWith(kb, StringComparison.Ordinal) || kb.StartsWith(ka, StringComparison.Ordinal);
+    }
+}

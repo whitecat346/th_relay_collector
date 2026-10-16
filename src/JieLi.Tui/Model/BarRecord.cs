@@ -88,3 +88,55 @@ public sealed class PromoItem
     public string Url { get; init; } = string.Empty;
     public bool IsEmpty => Text.Length == 0 && Url.Length == 0;
 }
+
+/// <summary>一条话题卡片解析出的"接力学"信息。</summary>
+public sealed class ParsedBar
+{
+    public string CardId { get; set; } = string.Empty;
+    public long AuthorMid { get; set; }
+    /// <summary>发布者（该卡片的所有者），不一定等于创作者。</summary>
+    public string PosterName { get; set; } = string.Empty;
+    public long PubTs { get; set; }
+    public string OpusUrl { get; set; } = string.Empty;
+
+    /// <summary>棒号原始文本（如 "06"、"第六"）；解析不到为 null。</summary>
+    public string? BarRaw { get; set; }
+    public int? BarNumber { get; set; }
+    public bool IsEx { get; set; }
+    /// <summary>EX 棒的序号（EX1/EX2…）。</summary>
+    public int? ExIndex { get; set; }
+
+    /// <summary>正文里声明的棒位时段（如 "20:30"），解析不到为空。</summary>
+    public string? DeclaredTime { get; set; }
+
+    /// <summary>正文里紧跟棒号的 @ 创作者。</summary>
+    public string? CreatorInText { get; set; }
+    public string? PrevName { get; set; }
+    public string? NextName { get; set; }
+
+    /// <summary>本条是否为代发：正文标注的创作者 ≠ 发布者。</summary>
+    public bool IsProxy { get; set; }
+    /// <summary>本条代发时的代发者（= 发布者）。</summary>
+    public string? ProxyName { get; set; }
+    /// <summary>上一棒的原作者（"上一棒：X（@Y 代发）" 里的 X），与本条无关。</summary>
+    public string? PrevOriginalAuthor { get; set; }
+    /// <summary>上一棒的代发者（上一棒那一句里标注的 @Y）。</summary>
+    public string? PrevProxyName { get; set; }
+
+    public string? ResolvedAuthor { get; set; }
+    public string? ResolvedAuthorLink { get; set; }
+
+    /// <summary>命中的棒号/时段写法（A–H），用于验证解析器的覆盖面。</summary>
+    public string? MatchedStyle { get; set; }
+
+    /// <summary>该卡片是否带本活动的话题标签（归属判定的最强信号）。</summary>
+    public bool HasTopicTag { get; set; }
+
+    public List<string> Conflicts { get; } = new();
+    public List<string> Notes { get; } = new();
+
+    /// <summary>本条卡片的"发布时刻"与"声明时段"的偏差（分钟）；任一缺失为 null。</summary>
+    public int? TimeDeviationMinutes { get; set; }
+
+    public bool IsUnattributable => BarNumber is null && !IsEx;
+}
