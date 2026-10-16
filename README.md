@@ -3,6 +3,9 @@
 半自动的接力归档流水线：**采集 → 解析交叉校验 → 人工确认 → 渲染归档**。
 .NET 10 / Windows x64 / 零第三方依赖（NuGet 缓存里没有 Spectre.Console，TUI 用原生 ANSI 自绘）。
 
+> 📖 **第一次用请先读 [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md)** —— 从首次自动收集、TUI 纠错到保存归档的完整手册。
+> 想知道"为什么这么设计 / 哪些做法已经试过并失败"请看 [`docs/CORPUS-FINDINGS.md`](docs/CORPUS-FINDINGS.md)。
+
 ## 为什么是"半自动"
 
 `ai_guild.md` 的原始要求是"谨慎、反复验证"，而实测语料证明了这一点：
