@@ -14,8 +14,22 @@ $tool = Split-Path -Parent $MyInvocation.MyCommand.Path
 $env:DOTNET_CLI_HOME = Join-Path $tool '.dotnet'
 $env:DOTNET_NOLOGO = '1'
 
+$projDir = Join-Path $tool 'src\JieLi.Tui'
+$proj = Join-Path $projDir 'JieLi.Tui.csproj'
+
+# 守卫：同一目录若存在第二个 .csproj/.slnx，`dotnet build <目录>` 会报
+# MSB1050「文件夹中包含多个项目或解决方案文件」。本脚本因为显式指定 .csproj 不受影响，
+# 但为了不让后来者踩坑，这里直接把重复文件点名报出来。
+$dupes = Get-ChildItem $projDir -File -ErrorAction SilentlyContinue |
+         Where-Object { $_.Name -ne 'JieLi.Tui.csproj' -and $_.Extension -in '.csproj', '.slnx', '.sln' }
+if ($dupes) {
+    Write-Warning ("src\JieLi.Tui 下存在多余的工程文件：{0}" -f (($dupes | ForEach-Object Name) -join ', '))
+    Write-Warning "  它们会让 'dotnet build src\JieLi.Tui' 报 MSB1050（多项目歧义）。"
+    Write-Warning "  本脚本显式指定了 JieLi.Tui.csproj，所以仍能正常发布；建议删除多余文件。"
+}
+
 Write-Host "==> 发布 relay-tool（net10.0 / win-x64 / 自包含单文件）"
-dotnet publish (Join-Path $tool 'src\JieLi.Tui\JieLi.Tui.csproj') `
+dotnet publish $proj `
     -c Release -r win-x64 --self-contained true `
     -p:PublishSingleFile=true `
     -p:IncludeNativeLibrariesForSelfExtract=true `

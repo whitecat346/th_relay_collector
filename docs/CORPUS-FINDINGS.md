@@ -133,3 +133,62 @@ https://www.bilibili.com/opus/1251685757239689233
 - 棒数异常（多种方法仍无法确定棒号）：**按用户要求按时间排序**，棒号列写 `N/A`，附加在末尾 —— 这类"很常见"，不算失败。
 - 创作者没被正确 @ 出来（B站不渲染 `<a>`）：**归为异常交人工处理**。
 - git 仓库**只在 `relay-tool/` 内** `init`，22 个归档目录**不入库、不迁移**；工具路径全 ASCII（防 UNICODE 问题），归档目录保持中文（那是用户的检索入口）。
+- 输入有两种模式（`ai_guild.md` 明写"tag URL **或单个接力链接**"）：**话题模式**（`--pipeline`）与**单链接模式**（`--opus`）；两者产出同构的 `review.jsonl`，共用同一套 TUI 与 render。
+
+## 九、单链接模式（接力未建话题）的实测事实
+
+### 页面是客户端渲染的，正文藏在 `__INITIAL_STATE__` 里
+
+| 数据 | 位置 |
+|---|---|
+| 帖子身份 | `detail.basic` —— `comment_id_str` 是**评论接口的 oid**，`comment_type`（opus 实测 12） |
+| 作者 | `detail.modules[MODULE_TYPE_AUTHOR].module_author` —— `name` / `mid` / `pub_ts` |
+| 标题 | `detail.modules[MODULE_TYPE_TITLE].module_title.text` |
+| **正文** | `detail.modules[MODULE_TYPE_CONTENT].module_content.paragraphs[]`（实测 116 段） |
+| 评论 | **不在页面里**，要另调接口 |
+
+### ⚠ 踩坑记录（全部实测验证过）
+
+- ❌ **只读 HTML 可见文本** —— 正文/棒次文字出现次数全是 **0**（页面只有壳）。
+- ❌ **读 `module_content.text`** —— 实测为**空**；正文只在 `paragraphs`。
+- ❌ **用正则取 `__INITIAL_STATE__`** —— 结尾形式每次不同（`</script>` / `(function` / 直接跟下一个标签），
+  正则匹配会随机失败。**必须用括号配平**扫描（`{}` 计数 + 字符串/转义感知）。
+- ❌ **以为 @ 是 `TEXT_NODE_TYPE_AT`** —— 实测 `@录谜` 是 **`TEXT_NODE_TYPE_RICH`** 节点：
+  类型在 `rich.type = "RICH_TEXT_NODE_TYPE_AT"`、UID 在 **`rich.rid`**、
+  **`jump_url` 是空字符串**。漏掉这条 → "下一棒 | @某人" 只拿到 "@"，@ 提及列表为空。
+- ✅ 节点类型：`TEXT_NODE_TYPE_WORD`（文字在 `word.words`）、`TEXT_NODE_TYPE_RICH`（见上）、
+  `TEXT_NODE_TYPE_EMOTE`（表情）。
+
+### 接口选择（实测对照）
+
+| 端点 | 结果 | 结论 |
+|---|---|---|
+| `x/v2/reply?oid=<comment_id_str>&type=12&sort=2&ps=20&pn=N` | **200 code=0**，有 `replies[]`（含楼中楼）、`page{num,size,count}`、`top`（置顶） | ✅ 抓评论 |
+| `x/v2/reply/wbi/main` | **-403 访问权限不足** | ❌ 不要用 |
+| `x/polymer/web-dynamic/v1/detail?id=<opus_id>` | **200 code=0**，`data.item` 有 id_str/type/module_author/major | ⚠ 只能补元数据 |
+| `x/space/arc/search` | 412（风控） | ❌ |
+| `x/space/wbi/arc/search` | **-352**（需要 WBI 签名） | ❌ 未实现签名前不可用 |
+| `x/space/opus/list`、`x/space/opus/space` | 404 | ❌ |
+| `x/opus/detail`、`x/opus/feed/detail` | 404 | ❌ |
+
+**⚠ `x/polymer/web-dynamic/v1/detail` 对 DRAW 型帖子的 `desc.text` 是 `null`、
+`rich_text_nodes` 为空数组、`major.draw` 只有图片 URL —— 正文完全拿不到。**
+所以单链接模式**必须抓 HTML 的 paragraphs**，JSON 接口只能作元数据交叉校验。
+
+### 链路遍历的现实
+
+- 正文里的 hashtag 是 `RICH` 节点，`jump_url` 指向 **search.bilibili.com**（实测该 URL 还 404），**不是** opus 链接。
+- 实测 `opus/1254218608972660737` 正文为
+  `第27棒 | 20:30 | @寒雨笙歌hy / 上一棒 | @录谜 / 下一棒 | @试作型拾九`，
+  **@ 只有 UID、没有指向那条动态的链接**。
+- 结论：**只能顺"链接"走，不能顺"名字"走**。只 @ 名字时无法自动跟进
+  （要自动跟进得靠 `space` 接口 + WBI 签名，尚未实现）；此时工具把 @ 的 UID 记进备注供人工核对。
+- 用户给的样例 `opus/959502913797881874` 实测**确实没有棒次标注**：正文是一篇小说（116 段）、
+  没有挂话题（`module_topic` 为空）、3 条评论也都无关。工具如实报"链接 0 个"，**不编造**。
+
+### 单链接模式的断言差异（否则会误报）
+
+话题模式的"缺棒"断言从 1 数到最高棒号；单链接模式**只知道链上那几条帖子**，
+必须**只检查已知棒位之间的空隙**，否则只给 1 条第27棒时会误报"缺棒 26"。
+TUI 里的断言回执（`ReviewView.RecomputeAssertions`）用的也是同一口径。
+
