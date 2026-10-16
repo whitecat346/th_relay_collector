@@ -87,6 +87,7 @@ pwsh -File relay-tool\publish.ps1
 
 ```
 relay-tool/
+├─ docs/CORPUS-FINDINGS.md  # ★ 实测语料规律与反模式（4 个真实话题 / 已失败的尝试 / 正则踩坑清单）
 ├─ src/JieLi.Tui/        # 源码
 │   ├─ Text/             # 终端显示宽度（CJK/emoji 按 2 列对齐）
 │   ├─ Model/            # 数据模型（BarRecord / TopicModels / ReviewItem）
