@@ -31,7 +31,8 @@ public sealed class ReviewView
     private List<ReviewItem> _items;
     private int _index;
     private int _top;
-    private bool _onlyPending = true;
+    /// <summary>默认显示全部（按棒序通读更直观，问题项高亮）；按 I 可切换为"只看待确认"。</summary>
+    private bool _onlyPending;
     private string? _toast;
     private bool _dirty;
 
@@ -48,12 +49,27 @@ public sealed class ReviewView
         _topicName = topicName;
         _items = ReviewStore.Load(workRoot, topicId);
 
-        // 初始光标：只显示待确认项时，必须落在第一个"未确认且未忽略"的条目上。
+        // 排序：按棒号升序（无棒号者按时段排到后面），便于按接力顺序通读
+        _items = _items
+            .OrderBy(i => i.Bar.HasValue ? 0 : (i.IsEx ? 1 : 2))
+            .ThenBy(i => i.Bar ?? int.MaxValue)
+            .ThenBy(i => TimeKeyOf(i.DeclaredTime))
+            .ToList();
+
+        // 初始光标：只显示待确认项时落在第一个"未确认且未忽略"的条目上。
         // （早期版本用 FindIndex 对全体条目查找，在 onlyPending 过滤下会得到 -1，
         //   于是 Current 恒为 null，所有确认/忽略按键静默失效 —— 由 M4 自检发现。）
         var pending = _items.FindIndex(i => !i.Confirmed && !i.Ignored);
         _index = pending >= 0 ? pending : 0;
         RecomputeAssertions();
+    }
+
+    private static int TimeKeyOf(string? hhmm)
+    {
+        if (string.IsNullOrWhiteSpace(hhmm)) return int.MaxValue;
+        var p = hhmm.Split(':');
+        if (p.Length != 2) return int.MaxValue;
+        return (int.TryParse(p[0], out var h) ? h : 0) * 60 + (int.TryParse(p[1], out var m) ? m : 0);
     }
 
     private List<ReviewItem> Visible =>
@@ -86,6 +102,7 @@ public sealed class ReviewView
         _c.Line($"{_c.Dim}待确认 {_c.Reset}{_c.Yellow}{pending}{_c.Reset}{_c.Dim}  "
                 + $"已确认 {_c.Reset}{_c.Green}{confirmed}{_c.Reset}{_c.Dim}  "
                 + $"已忽略 {_c.Reset}{ignored}{_c.Dim}  共 {_items.Count} 条"
+                + (_onlyPending ? "  [只看待确认]" : "  [显示全部]")
                 + (_dirty ? "   " + _c.Reset + _c.Yellow + "● 有未保存改动（按 S 保存）" + _c.Reset : "")
                 + _c.Reset);
         _c.Line(_c.Dim + ConsoleHost.Rule(width) + _c.Reset);
