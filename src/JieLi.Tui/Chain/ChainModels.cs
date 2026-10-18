@@ -141,6 +141,12 @@ public sealed class PostFacts
     /// <summary>本条声明的棒位时段（"20:30"）。</summary>
     public string? DeclaredTime { get; set; }
 
+    /// <summary>正文里声明的真正创作者（与发布者不同时才有值，如「原作者：X」「画师：X」）。</summary>
+    public string? CreatorInText { get; set; }
+    /// <summary>本条是否被标注为代发（代投/代发/代 upload）。</summary>
+    public bool IsProxy { get; set; }
+    public string? ProxyName { get; set; }
+
     public List<NeighborLink> Prevs { get; set; } = new();
     public List<NeighborLink> Nexts { get; set; } = new();
     public List<AtMention> Mentions { get; set; } = new();
@@ -201,7 +207,11 @@ public sealed class RelayQuery
     /// <summary>活动名（话题名优先）。用于标题过滤与匹配。</summary>
     public string? RelayName { get; set; }
     public long? TopicId { get; set; }
-    /// <summary>活动当天 0:00（本地时间）。候选人只在 [DayStart - 2h, DayEnd + 6h] 里找。</summary>
+    /// <summary>
+    /// 活动当天 0:00（本地时间）。候选人只在 [DayStart - 2h, DayEnd + 6h] 里找。
+    /// 约定：<c>DateTime.MinValue</c> 表示「未指定」，由遍历器从入口帖的发布时间推导；
+    /// <c>Year == 1</c> 但月日有效表示「用户只给了月-日」，年份用入口帖的年份补齐。
+    /// </summary>
     public DateTime DayStart { get; set; }
     public DateTime DayEnd { get; set; }
     /// <summary>时间窗（分钟）：接受条件之一。默认 90 = 1h30min（用户定的阈值）。</summary>

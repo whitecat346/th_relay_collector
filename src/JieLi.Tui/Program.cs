@@ -34,6 +34,22 @@ public static class Program
         string? opusTarget = null;
         string? outDir = null;
         bool forcePlain = false;
+        string? probeTarget = null;
+        string? probeJsonUrl = null;
+        string? probeUser = null;
+        long? probeSpaceUid = null;
+        string? relayArg = null;
+
+        // ---- 接力链遍历（本轮主线） ----
+        string? linkTarget = null;
+        var addLinks = new List<(string Url, int? Bar)>();
+        string? dateArg = null;
+        int hoursArg = 0;
+        string? asArg = null;
+        bool aiFlag = false;
+        bool aiYes = false;
+        int aiBudget = 20;
+        bool selfTestChain = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -91,12 +107,70 @@ public static class Program
                 case "--dump":
                     forcePlain = true;
                     break;
+                // 调试用：把一条帖子的读取结果原样 dump 成 JSON（链路遍历接入前的排错入口）
+                case "--probe":
+                    if (i + 1 < args.Length) probeTarget = args[++i];
+                    break;
+                case "--probe-json":
+                    if (i + 1 < args.Length) probeJsonUrl = args[++i];
+                    break;
+                case "--probe-user":
+                    if (i + 1 < args.Length) probeUser = args[++i];
+                    break;
+                case "--probe-space":
+                    if (i + 1 < args.Length && long.TryParse(args[++i], out var probeUid)) probeSpaceUid = probeUid;
+                    break;
+                case "--relay":
+                    if (i + 1 < args.Length) relayArg = args[++i];
+                    break;
+                // ---- 接力链遍历 ----
+                case "--link":
+                    if (i + 1 < args.Length) linkTarget = args[++i];
+                    break;
+                case "--add-link":
+                    if (i + 1 < args.Length) addLinks.Add((args[++i], null));
+                    break;
+                case "--at-bar":
+                    if (i + 1 < args.Length && addLinks.Count > 0 && int.TryParse(args[++i], out var forcedBar))
+                    {
+                        var last = addLinks[^1];
+                        addLinks[^1] = (last.Url, forcedBar);
+                    }
+                    break;
+                case "--date":
+                    if (i + 1 < args.Length) dateArg = args[++i];
+                    break;
+                case "--hours":
+                    if (i + 1 < args.Length) int.TryParse(args[++i], out hoursArg);
+                    break;
+                case "--as":
+                    if (i + 1 < args.Length) asArg = args[++i];
+                    break;
+                case "--ai":
+                    aiFlag = true;
+                    break;
+                case "--ai-yes":
+                    aiYes = true;
+                    break;
+                case "--ai-budget":
+                    if (i + 1 < args.Length) int.TryParse(args[++i], out aiBudget);
+                    break;
+                case "--selftest-chain":
+                    selfTestChain = true;
+                    break;
                 case "-h":
                 case "--help":
                     PrintHelp();
                     return 0;
             }
         }
+
+        // 调试入口不需要工作目录（也就不用先找 ai_guild.md）
+        if (probeTarget is not null)
+            return RunProbe(probeTarget);
+
+        if (selfTestChain)
+            return RunChainSelfTest();
 
         root ??= FindWorkspaceRoot();
         if (root is null || !Directory.Exists(root))
@@ -105,9 +179,17 @@ public static class Program
             return 2;
         }
 
+        var probeWorkRoot = outDir ?? Path.Combine(root, "relay-tool", "work");
+        if (probeJsonUrl is not null) return RunProbeJson(probeJsonUrl);
+        if (probeUser is not null) return RunProbeUser(probeWorkRoot, probeUser);
+        if (probeSpaceUid is not null) return RunProbeSpace(probeWorkRoot, probeSpaceUid.Value, relayArg);
+
+        // 接力链遍历（用户给一棒，双向自动补全整条链）
+        if (linkTarget is not null)
+            return RunLink(root, outDir, linkTarget, addLinks, dateArg, hoursArg, asArg, aiFlag, aiYes, aiBudget);
+
         if (collectTarget is not null)
             return RunCollect(root, collectTarget, outDir);
-
         if (parseTarget is not null)
             return RunParse(root, parseTarget, outDir);
 
@@ -753,6 +835,323 @@ public static class Program
     }
 
     /// <summary>从 exe 位置向上找到含活动目录的工作区根（以 ai_guild.md 或 relay-tool 目录为标记）。</summary>
+    // ------------------------------------------------------------- 接力链遍历（本轮主线）
+
+    /// <summary>
+    /// --link：给一棒，双向把整条接力链补全，落盘后交人工确认。
+    /// </summary>
+    private static int RunLink(
+        string root,
+        string? outDir,
+        string target,
+        List<(string Url, int? Bar)> addLinks,
+        string? dateArg,
+        int hoursArg,
+        string? asArg,
+        bool aiFlag,
+        bool aiYes,
+        int aiBudget)
+    {
+        using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        void Log(string m) => w.WriteLine(m);
+
+        var start = Chain.LinkResolver.Resolve(target, out var reason);
+        if (start is null)
+        {
+            Log("入口无法识别：" + (reason ?? "未知原因"));
+            return 2;
+        }
+        if (start.Kind == Chain.PostKind.Topic)
+        {
+            Log("话题入口的链遍历接线安排在下一轮。现在请改用「某一棒」的帖子链接（opus / 动态 / 视频）。");
+            return 2;
+        }
+
+        var supplements = new List<(Chain.PostRef Ref, int? ForcedBar)>();
+        foreach (var (url, forcedBar) in addLinks)
+        {
+            var r = Chain.LinkResolver.Resolve(url, out var why);
+            if (r is null)
+            {
+                Log($"补充链接无法识别：{url} —— {why}");
+                return 2;
+            }
+            supplements.Add((r, forcedBar));
+        }
+
+        var query = new Chain.RelayQuery { DeclaredHours = hoursArg > 0 ? hoursArg : 0 };
+        if (dateArg is not null)
+        {
+            if (!TryParseDateArg(dateArg, out var day))
+            {
+                Log($"--date 无法解析：「{dateArg}」。支持 2026-09-06 或 9-6（只给月日时年份取入口帖的年份）。");
+                return 2;
+            }
+            query.DayStart = day;
+            query.DayEnd = day.Year > 1
+                ? day.AddHours(hoursArg > 0 ? hoursArg : 24)
+                : day.AddHours(hoursArg > 0 ? hoursArg : 24);
+        }
+
+        var workRoot = outDir ?? Path.Combine(root, "relay-tool", "work");
+        Directory.CreateDirectory(workRoot);
+
+        using var http = new Chain.ChainHttp();
+        var cache = new Chain.UserCache(Path.Combine(workRoot, "users.json"));
+        cache.Load(Log);
+        var search = new Chain.ChainSearchClient(http);
+        var locator = new Chain.ChainUserLocator(http, search, cache);
+        var reader = new Chain.ChainPostReader(http);
+
+        Chain.AiAssist? ai = null;
+        if (aiFlag)
+        {
+            ai = Chain.AiAssist.Load(http, Path.Combine(root, "relay-tool", "ai.yml"), aiBudget, aiYes, Log);
+            if (ai is null) Log("⚠ 开启了 --ai，但没有可用的 ai.yml 配置；本次不做 AI 判定。");
+        }
+
+        Log($"入口：{start.Kind} {start.Id}");
+        Log($"工作目录：{workRoot}");
+        if (http.UsingLoginCookie) Log("本次使用了登录态（cookie.txt）。");
+        Log("");
+
+        var walker = new Chain.ChainWalker(http, reader, locator, ai) { MaxNodes = 80, MaxConsecutiveFailures = 2 };
+        Chain.ChainResult result;
+        try
+        {
+            result = walker.Walk(start, query, supplements, Log);
+        }
+        catch (Chain.ChainFetchException ex)
+        {
+            Log("遍历中止：" + ex.Message);
+            return 3;
+        }
+        catch (Exception ex)
+        {
+            Log($"遍历异常：{ex.GetType().Name}: {ex.Message}");
+            if (ex.InnerException is not null) Log("  内层：" + ex.InnerException.Message);
+            return 4;
+        }
+
+        var slug = !string.IsNullOrWhiteSpace(asArg)
+            ? asArg!.Trim()
+            : (!string.IsNullOrWhiteSpace(result.Slug) ? result.Slug : "chain_" + start.Id);
+
+        string dir;
+        try
+        {
+            dir = Chain.ChainWriter.Write(workRoot, slug, result, query, dateArg, Log);
+        }
+        catch (Exception ex)
+        {
+            Log("落盘失败：" + ex.Message);
+            return 2;
+        }
+
+        try { cache.Save(Log); } catch (Exception ex) { Log("⚠ 用户缓存写入失败：" + ex.Message); }
+
+        Log("");
+        Log("———— 遍历结果 ————");
+        Log($"  节点数       : {result.Nodes.Count}（其中拿到事实 {result.WithFacts} 条）");
+        Log($"  缺口         : {result.Gaps.Count} 处");
+        Log($"  请求数       : {http.RequestCount}");
+        Log($"  输出目录     : {dir}");
+        foreach (var warn in result.Warnings) Log($"  ⚠ {warn}");
+        Log("");
+        Log($"下一步：jieli --review {slug}   人工确认后 jieli --render {slug}");
+        return 0;
+    }
+
+    /// <summary>
+    /// --selftest-chain：离线自检（不联网）。
+    /// 覆盖链接嗅探与遍历器的纯逻辑；任何用例失败即返回 1。
+    /// </summary>
+    private static int RunChainSelfTest()
+    {
+        using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        int passed = 0, failed = 0;
+        void Check(string name, bool ok, string? detail = null)
+        {
+            if (ok)
+            {
+                passed++;
+                w.WriteLine($"  ✓ {name}");
+            }
+            else
+            {
+                failed++;
+                w.WriteLine($"  ✗ {name}{(detail is null ? "" : "  —— " + detail)}");
+            }
+        }
+
+        w.WriteLine("接力链遍历自检（离线）");
+        w.WriteLine("");
+        w.WriteLine("[1] 链接嗅探");
+        foreach (var (input, kind, id) in new (string, Chain.PostKind, string)[]
+        {
+            ("https://www.bilibili.com/opus/1236672288886095909", Chain.PostKind.Opus, "1236672288886095909"),
+            ("https://t.bilibili.com/1062664246531194885", Chain.PostKind.Opus, "1062664246531194885"),
+            ("https://m.bilibili.com/dynamic/1062664246531194885", Chain.PostKind.Opus, "1062664246531194885"),
+            ("https://www.bilibili.com/video/BV1abg36EEZ1/", Chain.PostKind.Video, "BV1abg36EEZ1"),
+            ("https://www.bilibili.com/video/av1136672288", Chain.PostKind.Video, "av1136672288"),
+            ("https://www.bilibili.com/v/topic/detail?topic_id=1343535", Chain.PostKind.Topic, "1343535"),
+            ("1236672288886095909", Chain.PostKind.Opus, "1236672288886095909"),
+            ("1343535", Chain.PostKind.Topic, "1343535"),
+        })
+        {
+            var r = Chain.LinkResolver.Resolve(input, out var why);
+            var ok = r is not null && r.Kind == kind && r.Id == id;
+            Check(string.IsNullOrEmpty(why) ? $"识别 {Short(input)}" : $"识别 {Short(input)}：{why}", ok,
+                r is null ? why : $"{r.Kind} {r.Id}");
+        }
+
+        foreach (var (input, expect) in new (string, string)[]
+        {
+            ("https://b23.tv/abcdefg", "短链"),
+            ("https://www.bilibili.com/read/cv123456", "cv"),
+            ("随便一段话", "无法识别"),
+        })
+        {
+            var r = Chain.LinkResolver.Resolve(input, out var why);
+            var ok = r is null && why is not null && why.Contains(expect, StringComparison.OrdinalIgnoreCase);
+            Check($"拒绝 {Short(input)} 并说明原因", ok, r is null ? why : $"意外识别成 {r.Kind} {r.Id}");
+        }
+
+        // 遍历器用例由 Chain 模块提供（离线，假 reader/locator 驱动）。
+        w.WriteLine("");
+        w.WriteLine("[2] 遍历器与落盘");
+        var chainCase = Chain.ChainSelfTest.Run(w.WriteLine);
+        passed += chainCase.Passed;
+        failed += chainCase.Failed;
+        w.WriteLine("");
+        w.WriteLine($"自检结果：通过 {passed}，失败 {failed}");
+        w.WriteLine(failed == 0 ? "✓ 自检通过" : "✗ 自检失败");
+        return failed == 0 ? 0 : 1;
+
+        static string Short(string s) => s.Length <= 42 ? s : s[..42] + "…";
+    }
+
+    /// <summary>解析 --date：2026-09-06 / 2026/9/6 / 9-6。</summary>
+    private static bool TryParseDateArg(string raw, out DateTime day)
+    {
+        day = default;
+        var s = raw.Trim().Replace('/', '-');
+        var m = Regex.Match(s, @"^(\d{4})-(\d{1,2})-(\d{1,2})$");
+        if (m.Success)
+        {
+            day = new DateTime(int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value), int.Parse(m.Groups[3].Value));
+            return true;
+        }
+        m = Regex.Match(s, @"^(\d{1,2})-(\d{1,2})$");
+        if (m.Success)
+        {
+            // 只给月日：用 Year==1 表示，年份由遍历器从入口帖补齐
+            day = new DateTime(1, int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value));
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>--probe-json：用 ChainHttp 打一个任意地址并把原文打出来（开发期排错用）。</summary>
+    private static int RunProbeJson(string url)
+    {
+        using var http = new Chain.ChainHttp();
+        try
+        {
+            var body = http.GetText(url, allowHtml: true);
+            Console.WriteLine(body.Length > 8000 ? body[..8000] + "\n…（已截断）" : body);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[probe-json] {ex.GetType().Name}: {ex.Message}");
+            return 1;
+        }
+    }
+
+    /// <summary>--probe-user：验证昵称 → 用户定位。</summary>
+    private static int RunProbeUser(string workRoot, string name)
+    {
+        using var http = new Chain.ChainHttp();
+        var cache = new Chain.UserCache(Path.Combine(workRoot, "users.json"));
+        cache.Load(Console.Error.WriteLine);
+        var locator = new Chain.ChainUserLocator(http, new Chain.ChainSearchClient(http), cache);
+        try
+        {
+            var user = locator.Resolve(name, null, m => Console.Error.WriteLine("[probe-user] " + m), CancellationToken.None);
+            if (user is null)
+            {
+                Console.WriteLine($"null  // 没有定位到「{name}」");
+                return 0;
+            }
+            Console.WriteLine($"{user.Uid}\t{user.Name}\t{user.Method}\tExact={user.Exact}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[probe-user] {ex.GetType().Name}: {ex.Message}");
+            return 1;
+        }
+    }
+
+    /// <summary>--probe-space：验证「用户 + 活动」→ 候选帖子。</summary>
+    private static int RunProbeSpace(string workRoot, long uid, string? relayName)
+    {
+        using var http = new Chain.ChainHttp();
+        var cache = new Chain.UserCache(Path.Combine(workRoot, "users.json"));
+        cache.Load(Console.Error.WriteLine);
+        var locator = new Chain.ChainUserLocator(http, new Chain.ChainSearchClient(http), cache);
+        try
+        {
+            var user = new Chain.UserRef { Uid = uid, Name = "?", Method = Chain.FetchMethod.Manual };
+            var query = new Chain.RelayQuery { RelayName = relayName };
+            var found = locator.FindPosts(user, query, m => Console.Error.WriteLine("[probe-space] " + m), CancellationToken.None);
+            Console.WriteLine($"候选 {found.Count} 条");
+            foreach (var c in found)
+                Console.WriteLine($"{c.PubTs}\t{c.Method}\t{c.Ref.Kind} {c.Ref.Id}\t{c.Title}\t{c.Why}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[probe-space] {ex.GetType().Name}: {ex.Message}");
+            return 1;
+        }
+    }
+
+    /// <summary>
+    /// --probe：把单条帖子的读取结果原样打印成 JSON。
+    /// 只用于开发期排错（链路遍历接线前的唯一观察窗口），不产出任何文件。
+    /// </summary>
+    private static int RunProbe(string target)
+    {
+        var link = Chain.LinkResolver.Resolve(target, out var reason);
+        if (link is null)
+        {
+            Console.Error.WriteLine(reason ?? "无法解析该链接。");
+            return 2;
+        }
+
+        Console.Error.WriteLine($"入口：{link.Kind} {link.Id} → {link.Url}");
+        using var http = new Chain.ChainHttp();
+        var reader = new Chain.ChainPostReader(http);
+        try
+        {
+            var facts = reader.Read(link, m => Console.Error.WriteLine("[probe] " + m), CancellationToken.None);
+            var options = new System.Text.Json.JsonSerializerOptions
+            {
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            };
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(facts, options));
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[probe] 读取失败：{ex.GetType().Name}: {ex.Message}");
+            return 1;
+        }
+    }
+
     private static string? FindWorkspaceRoot()
     {
         var dir = AppContext.BaseDirectory;
