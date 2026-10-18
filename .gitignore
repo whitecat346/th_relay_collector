@@ -15,6 +15,10 @@ publish/
 # 浏览器持久化 profile（当前方案不装 Playwright，仍按约定排除）
 .browser-profile/
 
+# 本地凭据：AI 配置与登录 cookie 绝不入库（只有 --ai / 有 cookie 时才用到）
+ai.yml
+cookie.txt
+
 # Excel 便利副本（规范产物是 UTF-8+BOM 的 .csv）
 *.excel.csv
 
