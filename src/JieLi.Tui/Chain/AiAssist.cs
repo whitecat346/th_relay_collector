@@ -23,6 +23,9 @@ public sealed class AiAssist : IAiAssist
     /// <inheritdoc />
     public bool Enabled => false;
 
+    /// <summary>ai-log.jsonl 的落盘路径（由调用方按 work/&lt;slug&gt;/ 指定）。</summary>
+    public string? LogPath { get; set; }
+
     /// <inheritdoc />
     public AiVerdict? Ask(AiRequest request, Action<string>? log, CancellationToken ct)
         => null; // 尚未实现

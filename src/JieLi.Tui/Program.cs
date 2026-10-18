@@ -908,6 +908,7 @@ public static class Program
         {
             ai = Chain.AiAssist.Load(http, Path.Combine(root, "relay-tool", "ai.yml"), aiBudget, aiYes, Log);
             if (ai is null) Log("⚠ 开启了 --ai，但没有可用的 ai.yml 配置；本次不做 AI 判定。");
+            else ai.LogPath = Path.Combine(workRoot, "ai-log.jsonl");
         }
 
         Log($"入口：{start.Kind} {start.Id}");
