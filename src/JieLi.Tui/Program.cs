@@ -50,6 +50,7 @@ public static class Program
         bool aiYes = false;
         int aiBudget = 20;
         bool selfTestChain = false;
+        Chain.PostKind? forcedKind = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -127,6 +128,16 @@ public static class Program
                 case "--link":
                     if (i + 1 < args.Length) linkTarget = args[++i];
                     break;
+                // 显式指定入口类型（嗅探认错时的后路）：--dyn / --video / --topic
+                case "--dyn":
+                    if (i + 1 < args.Length) { linkTarget = args[++i]; forcedKind = Chain.PostKind.Opus; }
+                    break;
+                case "--video":
+                    if (i + 1 < args.Length) { linkTarget = args[++i]; forcedKind = Chain.PostKind.Video; }
+                    break;
+                case "--topic":
+                    if (i + 1 < args.Length) { linkTarget = args[++i]; forcedKind = Chain.PostKind.Topic; }
+                    break;
                 case "--add-link":
                     if (i + 1 < args.Length) addLinks.Add((args[++i], null));
                     break;
@@ -186,7 +197,7 @@ public static class Program
 
         // 接力链遍历（用户给一棒，双向自动补全整条链）
         if (linkTarget is not null)
-            return RunLink(root, outDir, linkTarget, addLinks, dateArg, hoursArg, asArg, aiFlag, aiYes, aiBudget);
+            return RunLink(root, outDir, linkTarget, addLinks, dateArg, hoursArg, asArg, aiFlag, aiYes, aiBudget, forcedKind);
 
         if (collectTarget is not null)
             return RunCollect(root, collectTarget, outDir);
@@ -877,6 +888,35 @@ public static class Program
     // ------------------------------------------------------------- 接力链遍历（本轮主线）
 
     /// <summary>
+    /// 显式指定类型时的入口解析（`--dyn` / `--video` / `--topic`）：
+    /// 嗅探认错时用它兜底，仍要求输入里能取出对应 id，不做猜测。
+    /// </summary>
+    private static Chain.PostRef? ResolveForcedLink(string raw, Chain.PostKind kind, out string? reason)
+    {
+        reason = null;
+        var s = (raw ?? string.Empty).Trim().Trim('"', '\'', '<', '>', ' ');
+
+        if (kind == Chain.PostKind.Topic)
+        {
+            var id = ParseTopicId(s);
+            if (id is not null) return Chain.PostRef.Topic(id.Value.ToString());
+            reason = $"「{raw}」里没有话题 id（要 topic_id=数字 或 纯数字 topic_id）。";
+            return null;
+        }
+
+        var resolved = Chain.LinkResolver.Resolve(s, out reason);
+        if (resolved is null) return null;
+        if (resolved.Kind == kind) return resolved;
+
+        // 嗅探出的类型与显式指定不符：允许「纯数字被当成 topic」这类误判按显式类型纠正
+        if (kind == Chain.PostKind.Opus && resolved.Kind == Chain.PostKind.Topic)
+            return Chain.PostRef.Opus(resolved.Id);
+        reason = $"按 --{(kind == Chain.PostKind.Video ? "video" : "dyn")} 解析失败："
+                 + $"输入更像 {resolved.Kind}（{resolved.Id}）。";
+        return null;
+    }
+
+    /// <summary>
     /// --link：给一棒，双向把整条接力链补全，落盘后交人工确认。
     /// </summary>
     private static int RunLink(
@@ -889,12 +929,15 @@ public static class Program
         string? asArg,
         bool aiFlag,
         bool aiYes,
-        int aiBudget)
+        int aiBudget,
+        Chain.PostKind? forcedKind = null)
     {
         using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
         void Log(string m) => w.WriteLine(m);
 
-        var start = Chain.LinkResolver.Resolve(target, out var reason);
+        var start = forcedKind is null
+            ? Chain.LinkResolver.Resolve(target, out var reason)
+            : ResolveForcedLink(target, forcedKind.Value, out reason);
         if (start is null)
         {
             Log("入口无法识别：" + (reason ?? "未知原因"));

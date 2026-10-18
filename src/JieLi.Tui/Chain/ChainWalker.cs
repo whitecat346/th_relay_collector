@@ -98,6 +98,10 @@ public sealed class ChainWalker
         // ---- 2. 日期窗口：query 是 Program 那个实例，原地补齐 DayStart/DayEnd（ChainWriter 还要用）----
         ResolveQueryWindow(query, startFacts);
         if (string.IsNullOrWhiteSpace(query.RelayName)) query.RelayName = startFacts.RelayName;
+        // 视频/动态入口常常没有话题标签，RelayName 会是空的，于是自动命名退化成「2026_接力_x-x」。
+        // 退一步从标题里抽「【…接力…】」那段当活动名（实测标题里最可靠的活动名来源）。
+        if (string.IsNullOrWhiteSpace(query.RelayName))
+            query.RelayName = InferRelayNameFromTitle(startFacts.Title);
         result.RelayName = query.RelayName;
 
         var startNode = new ChainNode
@@ -197,6 +201,29 @@ public sealed class ChainWalker
         if (string.IsNullOrWhiteSpace(label)) return false;
         var digits = new string(label.Trim().TakeWhile(char.IsDigit).ToArray());
         return digits.Length > 0 && int.TryParse(digits, out bar);
+    }
+
+    /// <summary>
+    /// 从标题里抽活动名：优先【…】/「…」/『…』里含「接力」的那段，其次标题里第一个含「接力」的片段。
+    /// 例：「【神行话妄】亘古始怨翌塑轮回」→ 抽不到（返回 null）；
+    ///     「【8月15日魅魔日接力1.5】列王纪春秋」→「8月15日魅魔日接力1.5」。
+    /// </summary>
+    private static string? InferRelayNameFromTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return null;
+
+        foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(title, @"[【「『]([^】」』]{2,40})[】」』]"))
+        {
+            var inner = m.Groups[1].Value.Trim();
+            if (inner.Contains("接力", StringComparison.Ordinal)) return inner;
+        }
+
+        var idx = title.IndexOf("接力", StringComparison.Ordinal);
+        if (idx < 0) return null;
+        var start = Math.Max(0, idx - 12);
+        var end = Math.Min(title.Length, idx + 2);
+        var fragment = title[start..end].Trim(' ', '【', '】', '「', '」', '『', '』', '-', '—', '|', '/', '·');
+        return fragment.Length >= 4 ? fragment : null;
     }
 
     private static ChainNode? FindGapCoveringNode(WalkContext ctx, GapItem gap)
@@ -931,6 +958,15 @@ public sealed class ChainWalker
         var day = local != DateTime.MinValue ? local.Day : ctx.Query.DayStart.Day;
 
         result.RelayName = ctx.Query.RelayName ?? result.RelayName;
+        // 入口帖常常没挂话题（视频/动态），活动名往往要等链上别的棒才认得出来 —— 补一次。
+        if (string.IsNullOrWhiteSpace(result.RelayName))
+        {
+            result.RelayName = ctx.Result.Nodes
+                .Select(n => n.Facts?.RelayName)
+                .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
+            if (!string.IsNullOrWhiteSpace(result.RelayName) && string.IsNullOrWhiteSpace(ctx.Query.RelayName))
+                ctx.Query.RelayName = result.RelayName;   // ChainWriter/报告也要用
+        }
         result.Slug = $"{year}_{SanitizeSlug(result.RelayName ?? "接力")}_{month:00}-{day:00}";
 
         result.Audit.Add(new ChainAuditEntry
