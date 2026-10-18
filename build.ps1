@@ -36,6 +36,11 @@ if ($Name) {
         "-p:MSBuildProjectExtensionsPath=$objDir",
         "-p:BaseOutputPath=$outDir"
     )
+    # 覆盖 BaseIntermediateOutputPath 后，SDK 的默认排除项只认新路径，
+    # 工程内遗留的 obj\ / bin\ 会被 **/*.cs 当源码编进去 → CS0579「特性重复」。
+    # 必须用**环境变量**设置 DefaultItemExcludes（普通属性）：命令行 -p: 是全局属性，
+    # 不可再被 SDK 的 props 追加，实测无效；环境变量则会被 SDK 正常追加，实测有效。
+    $env:DefaultItemExcludes = 'obj\**;bin\**;.build\**'
 }
 
 & dotnet @buildArgs
