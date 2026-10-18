@@ -159,8 +159,102 @@ public sealed class ChainWalker
 
         InferChainBars(ctx);
         FinishResult(ctx);
+        PruneCoveredGaps(ctx);
         return result;
     }
+
+    /// <summary>
+    /// 去掉「其实已经拿到」的假缺口：某条缺口期望的人/棒，链上已经有节点覆盖它。
+    /// 判据要**同时**对上人和棒位（或双方都推不出棒位），否则会把「一人多棒」里
+    /// 真正还缺的那一棒也删掉。
+    /// </summary>
+    private static void PruneCoveredGaps(WalkContext ctx)
+    {
+        if (ctx.Result.Gaps.Count == 0) return;
+        var kept = new List<GapItem>(ctx.Result.Gaps.Count);
+        foreach (var gap in ctx.Result.Gaps)
+        {
+            var covered = FindGapCoveringNode(ctx, gap);
+            if (covered is null)
+            {
+                kept.Add(gap);
+                continue;
+            }
+            var key = covered.Facts is null ? "?" : KeyOf(covered.Facts, covered.Ref);
+            ctx.Log?.Invoke($"[缺口合并] 「{gap.ExpectedName}」第 {gap.ExpectedBar?.ToString() ?? "?"} 棒已被链上 postId={key} 覆盖，从缺口清单移除");
+        }
+        var removed = ctx.Result.Gaps.Count - kept.Count;
+        ctx.Result.Gaps.Clear();
+        ctx.Result.Gaps.AddRange(kept);
+        if (removed > 0)
+            ctx.Result.Warnings.Add($"已把 {removed} 处「其实已拿到」的缺口从清单里合并掉（同名同棒位在链上已有节点）");
+    }
+
+    /// <summary>缺口里的棒号是给人看的文本（可能是「7（推算）」），只取开头的数字。</summary>
+    private static bool TryParseBarLabel(string? label, out int bar)
+    {
+        bar = 0;
+        if (string.IsNullOrWhiteSpace(label)) return false;
+        var digits = new string(label.Trim().TakeWhile(char.IsDigit).ToArray());
+        return digits.Length > 0 && int.TryParse(digits, out bar);
+    }
+
+    private static ChainNode? FindGapCoveringNode(WalkContext ctx, GapItem gap)
+    {
+        if (string.IsNullOrWhiteSpace(gap.ExpectedName) && string.IsNullOrWhiteSpace(gap.ExpectedUid)) return null;
+        foreach (var n in ctx.Result.Nodes)
+        {
+            var f = n.Facts;
+            if (f is null) continue;
+
+            // 人对得上：uid 一致，或昵称归一化后一致
+            var samePerson =
+                (!string.IsNullOrWhiteSpace(gap.ExpectedUid)
+                    && long.TryParse(gap.ExpectedUid, out var gapUid) && gapUid > 0 && f.AuthorUid == gapUid)
+                || (!string.IsNullOrWhiteSpace(gap.ExpectedName) && SameNameFolded(f.AuthorName, gap.ExpectedName));
+            if (!samePerson) continue;
+
+            // 棒位也对得上：缺口没写棒号，或节点棒号相同
+            if (gap.ExpectedBar is null) return n;
+            var nodeBar = f.BarNumber;
+            if (nodeBar is not null && TryParseBarLabel(gap.ExpectedBar, out var gapBar) && nodeBar == gapBar) return n;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 昵称比较（缺口合并专用）：先走 TextNormalizer.SameName，再容忍繁体/异体差异。
+    /// 实测「雾雨梦灵」（帖子里写的）与「霧雨梦灵」（账号真名）被当成两个人，
+    /// 于是链上明明已经有那一棒，缺口清单里还挂着一条假缺口。
+    /// </summary>
+    private static bool SameNameFolded(string? a, string? b)
+    {
+        if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)) return false;
+        if (TextNormalizer.SameName(a, b)) return true;
+        return string.Equals(FoldVariant(a), FoldVariant(b), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>把常见繁体/异体字折叠成简体，并去空白/标点（只用于比较，不写回数据）。</summary>
+    private static string FoldVariant(string name)
+    {
+        var sb = new System.Text.StringBuilder(name.Length);
+        foreach (var ch in name)
+        {
+            if (char.IsWhiteSpace(ch) || char.IsPunctuation(ch)) continue;
+            sb.Append(FoldMap.TryGetValue(ch, out var mapped) ? mapped : ch);
+        }
+        return sb.ToString();
+    }
+
+    private static readonly Dictionary<char, char> FoldMap = new()
+    {
+        ['霧'] = '雾', ['靈'] = '灵', ['夢'] = '梦', ['繪'] = '绘', ['畫'] = '画',
+        ['燈'] = '灯', ['貓'] = '猫', ['鳥'] = '鸟', ['魚'] = '鱼', ['龍'] = '龙',
+        ['風'] = '风', ['雲'] = '云', ['銀'] = '银', ['紅'] = '红', ['藍'] = '蓝',
+        ['綠'] = '绿', ['黃'] = '黄', ['點'] = '点', ['線'] = '线', ['聲'] = '声',
+        ['樂'] = '乐', ['戀'] = '恋', ['愛'] = '爱', ['戰'] = '战', ['鬥'] = '斗',
+        ['無'] = '无', ['盡'] = '尽', ['終'] = '终', ['緣'] = '缘',
+    };
 
     // ================================================================ 节点管理
 
@@ -378,6 +472,10 @@ public sealed class ChainWalker
         var hint = string.IsNullOrWhiteSpace(link.Uid) ? null : link.Uid!.Trim();
         if (string.IsNullOrWhiteSpace(expectedName) && string.IsNullOrWhiteSpace(hint))
             return NeighborResolution.Failed("该 @ 指认没有可用的昵称/uid，无法定位用户");
+
+        // 这条 @ 指认可能早就被别的路径覆盖了（例如 5→7 与 6→7 都指向同一个人）。
+        // 这里只做快速跳过（同一 uid 且**棒位也一致**才跳过，避免把「一人多棒」误判成已覆盖）；
+        // 真正的去重在遍历结束后由 PruneCoveredGaps 统一做。
 
         // ---- ① 名字（或 @uid）→ uid ----
         UserRef? user = null;
