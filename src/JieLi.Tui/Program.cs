@@ -452,14 +452,26 @@ public static class Program
 
     private static int RunRender(string root, string workRoot, string target, string? archiveRoot, bool allowUnconfirmed)
     {
+        // target 有两种：话题管线用 topic_id（纯数字），链遍历用 slug（--as 或 chain_<id>）。
+        // 链遍历没有 topic_id，但它的 work/<slug>/ 目录结构、review.jsonl、meta.yml 完全同形，
+        // 所以这里只是把「按 topic_id 定位工作目录」换成「按 slug 定位」，其余流程一字不改。
         long? topicId = ParseTopicId(target);
-        if (topicId is null) { Console.Error.WriteLine($"无法从「{target}」解析出 topic_id。"); return 2; }
+        var isSlug = topicId is null;
+        var workKey = isSlug ? target.Trim() : topicId!.Value.ToString();
+
+        if (isSlug && !IsSafeSlug(workKey))
+        {
+            Console.Error.WriteLine($"无法从「{target}」解析出 topic_id，也不像一个安全的工作目录名（slug）。");
+            return 2;
+        }
 
         using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
         void Log(string m) => w.WriteLine(m);
 
-        var manifest = TopicCollector.LoadManifest(workRoot, topicId.Value);
-        var metaPath = ArchiveMeta.PathFor(workRoot, topicId.Value);
+        var manifest = isSlug ? null : TopicCollector.LoadManifest(workRoot, topicId!.Value);
+        var metaPath = isSlug
+            ? Path.Combine(workRoot, workKey, "meta.yml")
+            : ArchiveMeta.PathFor(workRoot, topicId!.Value);
 
         // meta.yml 不存在时生成草稿（宣传信息是人工拍板项，草稿只做提示，绝不填机器猜测值）
         if (!File.Exists(metaPath))
@@ -467,8 +479,10 @@ public static class Program
             var dir = Path.GetDirectoryName(metaPath)!;
             Directory.CreateDirectory(dir);
             File.WriteAllText(metaPath,
-                ArchiveMeta.DraftYaml(manifest?.Name ?? topicId.Value.ToString(), topicId.Value,
-                                      manifest?.TopicUrl ?? "", null),
+                isSlug
+                    ? ArchiveMeta.DraftYaml(workKey, 0, "", null)
+                    : ArchiveMeta.DraftYaml(manifest?.Name ?? topicId!.Value.ToString(), topicId!.Value,
+                                            manifest?.TopicUrl ?? "", null),
                 new UTF8Encoding(false));
             Log($"未找到 meta.yml，已生成草稿：{metaPath}");
             Log("请先填写主催与宣传链接，再重新运行 --render。");
@@ -476,18 +490,27 @@ public static class Program
         }
 
         var meta = ArchiveMeta.Load(metaPath);
-        var items = ReviewStore.Load(workRoot, topicId.Value);
+        var items = isSlug
+            ? ReviewStore.Load(workRoot, workKey)
+            : ReviewStore.Load(workRoot, topicId!.Value);
         if (items.Count == 0)
         {
-            Log($"没有找到 review.jsonl（先跑 --pipeline {topicId}）。");
+            Log($"没有找到 review.jsonl（先跑 --pipeline {workKey}，或 --link 链遍历）。");
             return 2;
         }
 
         var archiveDir = archiveRoot ?? root;
         try
         {
-            var r = ArchiveRenderer.Render(workRoot, topicId.Value, meta, items, archiveDir, allowUnconfirmed);
-            Log($"话题「{meta.Title ?? manifest?.Name}」渲染完成");
+            var r = ArchiveRenderer.Render(
+                workRoot,
+                isSlug ? 0 : topicId!.Value,
+                meta, items, archiveDir, allowUnconfirmed,
+                writeFiles: true,
+                workSlug: isSlug ? workKey : null,
+                // 链遍历的 report.md 是缺口清单，别被审阅报告覆盖
+                reportFileName: isSlug ? "render-report.md" : null);
+            Log($"话题「{meta.Title ?? manifest?.Name ?? workKey}」渲染完成");
             Log($"  输出目录   {r.OutputDirectory}");
             Log($"  整点棒     {r.BarCount - r.ExCount} 根");
             Log($"  ex 棒      {r.ExCount} 根");
@@ -823,6 +846,22 @@ public static class Program
     }
 
     /// <summary>从数字 id 或话题链接里取出 topic_id。</summary>
+    /// <summary>
+    /// 链遍历的工作目录名（slug）是否安全：只允许字母/数字/下划线/短横/点，
+    /// 且不能是 . / .. —— 因为它会直接拼进 workRoot 下的路径。
+    /// </summary>
+    private static bool IsSafeSlug(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s) || s.Length > 80) return false;
+        if (s is "." or "..") return false;
+        foreach (var c in s)
+        {
+            if (char.IsLetterOrDigit(c) || c is '_' or '-' or '.') continue;
+            return false;
+        }
+        return s.Any(char.IsLetterOrDigit);
+    }
+
     private static long? ParseTopicId(string s)
     {
         s = s.Trim();

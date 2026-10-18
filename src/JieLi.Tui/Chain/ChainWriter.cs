@@ -223,8 +223,10 @@ public static class ChainWriter
             if (facts.PubLocal != DateTime.MinValue && MatchVerifier.TryParseHourMinute(facts.DeclaredTime, out var declaredMinutes))
                 view.DeviationMinutes = (int)Math.Round((facts.PubLocal - NearestSlot(facts.PubLocal, declaredMinutes)).TotalMinutes);
 
-            view.Unattributable = facts.AuthorUid <= 0
-                || result.Gaps.Any(g => g.FromPostId == facts.PostId || (Blank(g.FromPostUrl) == false && g.FromPostUrl == facts.Url));
+            // 注意：这里**不**把「本条有未定位的邻居（缺口）」算成无法归属。
+            // 缺口是链条层面的事（写在 report.md 的缺口清单里），和这一棒的作者/作品能否归属无关。
+            // 早先把它算进来的后果：第 6、14 棒作者与链接都齐，TUI 里却显示「无法归属」，极易误判。
+            view.Unattributable = facts.AuthorUid <= 0;
 
             views.Add(view);
         }

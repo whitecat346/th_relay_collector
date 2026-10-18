@@ -217,6 +217,17 @@ foreach ($id in $ids) {
 → 接着跑：jieli --review e2e_meimo
 ```
 
+后面的两步与话题模式**完全一样**，只是把 `topic_id` 换成这个 slug：
+
+```powershell
+& $exe --review e2e_meimo      # 进 TUI 逐条确认（A/G/C 三个键见 4.2）
+& $exe --render e2e_meimo      # 出 CSV + md（第一次会先要你填 work/e2e_meimo/meta.yml）
+```
+
+`--render` 认 slug 时会先要 `meta.yml`（草稿自动生成、`title` 会是 slug），
+填好再跑一次即出产物；只读的审阅报告写到 `work/<slug>/render-report.md`，
+**不会覆盖**链遍历自己的 `report.md`（那里是缺口清单）。
+
 #### 补不齐的时候（这是设计内的流程，不是失败）
 
 `report.md` 里有一份**缺口清单**，每条都带原因、已试过的手段，以及可以直接复制的补录命令：

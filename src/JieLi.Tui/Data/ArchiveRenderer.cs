@@ -65,8 +65,13 @@ public static class ArchiveRenderer
         IReadOnlyList<ReviewItem> items,
         string archiveRoot,
         bool allowUnconfirmed,
-        bool writeFiles = true)
+        bool writeFiles = true,
+        string? workSlug = null,
+        string? reportFileName = null)
     {
+        // workSlug 非空 = 链遍历模式（工作目录是 work/<slug>，没有 topic_id）；
+        // reportFileName 可换名，避免覆盖链遍历自己写的 report.md（那里是缺口清单）。
+        var workKey = string.IsNullOrWhiteSpace(workSlug) ? topicId.ToString() : workSlug!;
         var warnings = new List<string>();
 
         // ---------- 闸门①：人工确认 ----------
@@ -92,7 +97,7 @@ public static class ArchiveRenderer
         var baseName = Path.GetFileName(outDir);
         var csvPath = Path.Combine(outDir, baseName + ".csv");
         var mdPath = Path.Combine(outDir, baseName + ".md");
-        var reportPath = Path.Combine(workRoot, topicId.ToString(), "report.md");
+        var reportPath = Path.Combine(workRoot, workKey, reportFileName ?? "report.md");
 
         if (writeFiles)
         {
@@ -100,7 +105,7 @@ public static class ArchiveRenderer
             File.WriteAllText(csvPath, BuildCsv(rows, unnumbered), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
             File.WriteAllText(mdPath, BuildMarkdown(meta, rows, unnumbered), new UTF8Encoding(false));
             Directory.CreateDirectory(Path.GetDirectoryName(reportPath)!);
-            File.WriteAllText(reportPath, BuildReport(meta, topicId, rows, unnumbered, items, warnings), new UTF8Encoding(false));
+            File.WriteAllText(reportPath, BuildReport(meta, workKey, rows, unnumbered, items, warnings), new UTF8Encoding(false));
         }
 
         return new RenderResult
@@ -313,15 +318,15 @@ public static class ArchiveRenderer
     // ---------------------------------------------------------------- 只读报告
 
     private static string BuildReport(
-        ArchiveMeta meta, long topicId, List<ArchiveRow> rows, List<ArchiveRow> unnumbered,
+        ArchiveMeta meta, string workKey, List<ArchiveRow> rows, List<ArchiveRow> unnumbered,
         IReadOnlyList<ReviewItem> items, List<string> warnings)
     {
         var sb = new StringBuilder();
         sb.Append("<!-- 本文件由 relay-tool 自动生成，是只读产物；任何修改都会被下次生成覆盖。 -->\n");
-        sb.Append("<!-- 人工确认只能在 TUI 里做（jieli --review ").Append(topicId).Append("）。 -->\n\n");
-        sb.Append($"# 审阅报告 · {meta.Title ?? topicId.ToString()}\n\n");
+        sb.Append("<!-- 人工确认只能在 TUI 里做（jieli --review ").Append(workKey).Append("）。 -->\n\n");
+        sb.Append($"# 审阅报告 · {meta.Title ?? workKey}\n\n");
         sb.Append($"- 生成时间：{DateTime.Now:yyyy-MM-dd HH:mm:ss}\n");
-        sb.Append($"- topic_id：{topicId}\n");
+        sb.Append($"- 工作目录：{workKey}\n");
         sb.Append($"- 条目总数：{items.Count}（已确认 {items.Count(i => i.Confirmed)}／已忽略 {items.Count(i => i.Ignored)}）\n");
         sb.Append($"- 输出棒位：{rows.Count(r => !r.IsEx)} 根整点棒 + {rows.Count(r => r.IsEx)} 根 ex 棒\n");
         sb.Append($"- 棒数异常：{unnumbered.Count} 条（已按时间排序附在 md 末尾）\n\n");
