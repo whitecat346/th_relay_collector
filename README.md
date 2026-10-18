@@ -26,19 +26,39 @@
 # 需要网络。若在受限沙箱内，需放开对 Schannel 凭证目录的写入，
 # 否则报 "安全包中没有可用的凭证"（SEC_E_NO_CREDENTIALS）。
 jieli --pipeline <topic_id|话题链接>      # 采集 → 解析 → 写 work/<id>/review.jsonl
-jieli --review   <topic_id>               # TUI 人工确认（唯一合法确认入口）
-jieli --render   <topic_id>               # 出 CSV + 三段式 md + 只读报告
-jieli --backfill [--apply] [--fix-header] # 旧归档零风险回填（默认干跑）
+jieli --link "<任意一棒的链接>"            # 链遍历：没建话题的接力，顺 @ 双向铺开
+                                          #   产出 work/<slug>/{chain.json,review.jsonl,report.md}
+jieli --link "<链接>" --add-link "<链接>"  # 补录缺口（可多次；--at-bar N 人工指定棒号）
+jieli --link "<链接>" --date 2025-08-15 --hours 32 --as <目录名>
+jieli --link "<链接>" --ai [--ai-yes] [--ai-budget 20]   # AI 辅助（默认关，需 ai.yml）
+jieli --review   <topic_id|slug>           # TUI 人工确认（唯一合法确认入口；A/G/C 见手册）
+jieli --render   <topic_id|slug>           # 出 CSV + 三段式 md + 只读报告
+jieli --backfill [--apply] [--fix-header]  # 旧归档零风险回填（默认干跑）
 
 # 全部离线
 jieli --parse  <topic_id>                 # 交叉校验与棒表（读已采集数据）
 jieli --roster <topic_id>                 # 只抽"总结名册"（收集方法优先级 1）
+jieli --selftest-chain                    # 链遍历离线自检（链接嗅探 + 遍历器纯逻辑）
 jieli --selftest-review <topic_id>        # 用合成按键自检人工确认状态机
 jieli                                     # 只读审阅已有归档（22 个目录）
 ```
 
 常用开关：`--root <路径>`（默认自动向上查找 `ai_guild.md`）、`--out <目录>`（默认 `relay-tool/work`）、
 `--archive-root <目录>`（渲染输出根）、`--allow-unconfirmed`、`--plain`（纯文本，便于脚本化验收）。
+
+## 链遍历（`--link`）怎么走
+
+接力帖之间通常**不贴链接**，而是 `@` 出下一棒是谁。所以工具不靠链接接力，而是：
+
+1. 读入口那一棒（动态/专栏/视频），抽出棒号、时段、`上一棒`、`下一棒`、代发；
+2. 把 `@名字` 解析成 uid（`@` 组件自带 uid；手打的按昵称搜索，容忍错字/异体/改名）；
+3. 去那个 uid 的空间动态里找候选（`opus/feed/space`），不行再搜文章、搜视频；
+4. **命中判据**：对方帖里反向 `@` 回你（结构证据，权重最高）**或** 发布时间落在该棒时段 ±90 分钟；
+5. 同时向前向后走，遇到「收尾/最后一棒」标记、两向相遇、或连续两次失败就停；
+6. 拿不准的不编造 —— 写进 `report.md` 的**缺口清单**，附可直接复制的 `--add-link` 命令。
+
+已知局限：搜索类接口会风控（返回 `code=0` + `v_voucher`），此时视频棒最易漏，需人工补链接；
+改名/换号、一人多棒的情况要人工在 TUI 里确认。
 
 ## 产物契约
 

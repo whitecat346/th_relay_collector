@@ -156,6 +156,8 @@ public sealed class PostFacts
     public string? LastMarkRaw { get; set; }
     /// <summary>显式首棒标记（第一棒/开局/首棒）。</summary>
     public bool FirstMark { get; set; }
+    /// <summary>首棒标记的原文（与 LastMarkRaw 对称，进报告便于人工复核）。</summary>
+    public string? FirstMarkRaw { get; set; }
 
     public string BodyText { get; set; } = string.Empty;
     public string CommentsText { get; set; } = string.Empty;
@@ -187,6 +189,11 @@ public sealed class PostCandidate
     public string Title { get; set; } = string.Empty;
     public long PubTs { get; set; }
     public FetchMethod Method { get; set; } = FetchMethod.Unknown;
+    /// <summary>
+    /// 候选的作者 uid（视频搜索能直接给 mid，空间动态接口按 host_mid 已知）。
+    /// 用于「一次搜索建立全活动视频索引、之后按 mid 本地过滤」，避免反复打搜索接口。
+    /// </summary>
+    public long AuthorUid { get; set; }
     /// <summary>为什么认为它是候选（审计与报告用）。</summary>
     public string Why { get; set; } = string.Empty;
 }
@@ -218,6 +225,14 @@ public sealed class RelayQuery
     public int WindowMinutes { get; set; } = 90;
     /// <summary>活动是 24h 还是 32h 等，仅用于放宽搜索区间与报告。</summary>
     public int DeclaredHours { get; set; }
+
+    /// <summary>
+    /// 「当前这一步是从哪一棒出发的」的源帖 id（opus/dynamic id），由遍历器在每次
+    /// FindPosts 前写入。用途：空间动态接口只回「正文首行」，接力帖首行常常不含活动名，
+    /// 标题过滤会漏掉真正那一棒；此时按 opus id 与源帖 id 的距离做时间近似排序兜底。
+    /// 0 = 没有锚点（用动态顺序兜底）。
+    /// </summary>
+    public long AnchorPostId { get; set; }
 
     public DateTime SearchStart => DayStart.AddHours(-2);
     public DateTime SearchEnd => DayEnd.AddHours(6);

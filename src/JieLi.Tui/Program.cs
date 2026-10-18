@@ -953,7 +953,7 @@ public static class Program
 
         Log("");
         Log("———— 遍历结果 ————");
-        Log($"  节点数       : {result.Nodes.Count}（其中拿到事实 {result.WithFacts} 条）");
+        Log($"  节点数       : {result.Nodes.Count}（其中拿到事实 {result.WithFacts.Count()} 条）");
         Log($"  缺口         : {result.Gaps.Count} 处");
         Log($"  请求数       : {http.RequestCount}");
         Log($"  输出目录     : {dir}");

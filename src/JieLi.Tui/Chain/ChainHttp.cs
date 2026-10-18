@@ -131,6 +131,18 @@ public sealed class ChainHttp : IDisposable
             var msg = doc.RootElement.TryGetProperty("message", out var m) ? m.GetString() : null;
             throw new ChainFetchException($"接口 code={code.GetInt32()} message={msg} —— {url}");
         }
+
+        // 风控挑战：搜索类接口在疑似自动化时回 code=0 + data={"v_voucher":"voucher_..."}，
+        // 没有 result 数组。**必须单独识别**，否则会被当成「搜到 0 条」，
+        // 让人误以为活动里真的没有视频/文章（实测就是这么漏掉两棒的）。
+        if (doc.RootElement.ValueKind == JsonValueKind.Object
+            && doc.RootElement.TryGetProperty("data", out var data)
+            && data.ValueKind == JsonValueKind.Object
+            && data.TryGetProperty("v_voucher", out _))
+        {
+            throw new ChainFetchException($"接口返回风控挑战 v_voucher（这不是「没搜到」，请稍后重试或人工提供链接）—— {url}");
+        }
+
         return json;
     }
 

@@ -1,5 +1,7 @@
 #nullable enable
 using System.Text;
+using System.Text.RegularExpressions;
+using JieLi.Tui.Chain;
 using JieLi.Tui.Data;
 using JieLi.Tui.Model;
 using JieLi.Tui.Text;
@@ -19,10 +21,20 @@ namespace JieLi.Tui.Tui;
 ///   P          改代发者          N          写备注
 ///   D          在浏览器打开作品链接（跳转取证）
 ///   S          保存到 review.jsonl 并重跑断言
+///   A          补录：粘贴一棒帖子链接（opus / 动态 / 视频），读成一条待确认记录
+///   G          缺口视图（读 work/&lt;目录&gt;/chain.json 的 gaps，只读）
+///   C          链条视图（只读，棒号/时段/创作者/来源/方向/置信/@反指）
 ///   I          只看待确认项（切换过滤）    Esc/Q  返回
 /// </summary>
 public sealed class ReviewView
 {
+    private enum Panel
+    {
+        None,
+        Gaps,
+        Chain,
+    }
+
     private readonly ConsoleHost _c;
     private readonly string _workRoot;
     private readonly long _topicId;
@@ -41,6 +53,11 @@ public sealed class ReviewView
     /// <summary>人工改动后重新计算的断言结果（立即反馈）。</summary>
     private (int Attributed, int Dups, List<int> Missing, int Unattributed) _assertions;
 
+    // ---- 只读面板（G 缺口 / C 链条）：与确认列表互斥，打开期间不响应任何会改列表的键 ----
+    private Panel _panel = Panel.None;
+    private ChainView? _chain;
+    private string? _panelError;
+
     public bool ShouldExit { get; private set; }
 
     public ReviewView(ConsoleHost c, string workRoot, long topicId, string topicName, string? slug = null)
@@ -55,12 +72,7 @@ public sealed class ReviewView
             ? ReviewStore.Load(workRoot, slug)
             : ReviewStore.Load(workRoot, topicId);
 
-        // 排序：按棒号升序（无棒号者按时段排到后面），便于按接力顺序通读
-        _items = _items
-            .OrderBy(i => i.Bar.HasValue ? 0 : (i.IsEx ? 1 : 2))
-            .ThenBy(i => i.Bar ?? int.MaxValue)
-            .ThenBy(i => TimeKeyOf(i.DeclaredTime))
-            .ToList();
+        SortItems();
 
         // 初始光标：只显示待确认项时落在第一个"未确认且未忽略"的条目上。
         // （早期版本用 FindIndex 对全体条目查找，在 onlyPending 过滤下会得到 -1，
@@ -76,6 +88,16 @@ public sealed class ReviewView
         var p = hhmm.Split(':');
         if (p.Length != 2) return int.MaxValue;
         return (int.TryParse(p[0], out var h) ? h : 0) * 60 + (int.TryParse(p[1], out var m) ? m : 0);
+    }
+
+    /// <summary>排序：按棒号升序（无棒号者按时段排到后面），便于按接力顺序通读。</summary>
+    private void SortItems()
+    {
+        _items = _items
+            .OrderBy(i => i.Bar.HasValue ? 0 : (i.IsEx ? 1 : 2))
+            .ThenBy(i => i.Bar ?? int.MaxValue)
+            .ThenBy(i => TimeKeyOf(i.DeclaredTime))
+            .ToList();
     }
 
     private List<ReviewItem> Visible =>
@@ -94,6 +116,13 @@ public sealed class ReviewView
 
     public void Render(int width, int height)
     {
+        // G / C 是只读面板：与确认列表互斥，Enter/X 等按键在面板里一律不生效。
+        if (_panel != Panel.None)
+        {
+            RenderPanel(width, height);
+            return;
+        }
+
         var visible = Visible;
         if (_index >= visible.Count) _index = Math.Max(0, visible.Count - 1);
 
@@ -182,12 +211,18 @@ public sealed class ReviewView
         // ---- 页脚 ----
         _c.Line(_c.Dim + ConsoleHost.Rule(width) + _c.Reset);
         if (_toast is not null) _c.Line(_c.Yellow + _toast + _c.Reset);
-        _c.Line(_c.Dim + "Enter 确认  X 忽略  R 撤销  B 棒号  T 时段  U 创作者  K 类型  P 代发者  N 备注  D 打开链接  S 保存  I 过滤  Esc 返回" + _c.Reset);
+        _c.Line(_c.Dim + "Enter 确认  X 忽略  R 撤销  B 棒号  T 时段  U 创作者  K 类型  P 代发者  N 备注  A 补录  G 缺口  C 链条  D 打开链接  S 保存  I 过滤  Esc 返回" + _c.Reset);
     }
 
     /// <summary>返回 true 表示需要重新渲染由调用方控制；这里直接处理全部按键。</summary>
     public void HandleKey(ConsoleKeyInfo key)
     {
+        if (_panel != Panel.None)
+        {
+            HandlePanelKey(key);
+            return;
+        }
+
         var cur = Current;
         switch (key.Key)
         {
@@ -212,6 +247,16 @@ public sealed class ReviewView
                 return;
             case ConsoleKey.D:
                 if (cur is not null) OpenInBrowser(cur.OpusUrl);
+                return;
+            // A/G/C 是新增的纯展示/补录入口：不进入 CSV 契约，也不改变上面任何既有键的行为。
+            case ConsoleKey.A:
+                AddByLink();
+                return;
+            case ConsoleKey.G:
+                OpenPanel(Panel.Gaps);
+                return;
+            case ConsoleKey.C:
+                OpenPanel(Panel.Chain);
                 return;
         }
 
@@ -287,6 +332,216 @@ public sealed class ReviewView
                             });
                 break;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 新增三键：A 补录 / G 缺口 / C 链条。全部是"只读展示或补录"，
+    // 不进 CSV/MD 契约；既有按键语义保持不变。
+    // -----------------------------------------------------------------------
+
+    /// <summary>当前 work 下的目录名。单链接模式是 opus_&lt;id&gt;；话题模式退回 topicId。</summary>
+    private string ChainSlug => _slug is { Length: > 0 } ? _slug : _topicId.ToString();
+
+    private void OpenPanel(Panel panel)
+    {
+        _panel = panel;
+        _toast = null;
+        try
+        {
+            // 每次打开都重新读：chain.json 可能在另一路命令里刚生成/更新。
+            _chain = ChainView.TryLoad(_workRoot, ChainSlug, out var error);
+            _panelError = error;
+        }
+        catch (Exception ex)
+        {
+            _chain = null;
+            _panelError = "读取 chain.json 失败：" + ex.Message;
+        }
+    }
+
+    private void HandlePanelKey(ConsoleKeyInfo key)
+    {
+        switch (key.Key)
+        {
+            case ConsoleKey.Escape:
+            case ConsoleKey.Q:
+                _panel = Panel.None;
+                _toast = null;
+                return;
+            case ConsoleKey.G:
+                OpenPanel(Panel.Gaps);
+                return;
+            case ConsoleKey.C:
+                OpenPanel(Panel.Chain);
+                return;
+            default:
+                // 面板内只读：忽略其它按键，避免"按了 Enter 却改了列表"的意外。
+                return;
+        }
+    }
+
+    private void RenderPanel(int width, int height)
+    {
+        if (_chain is null)
+        {
+            var title = _panel == Panel.Gaps ? "缺口清单" : "链条视图";
+            ChainView.RenderUnavailable(_c, title, _panelError,
+                $"jieli --link <某一棒的帖子链接> [--date 2026-9-6] [--as {ChainSlug}]");
+        }
+        else if (_panel == Panel.Gaps)
+        {
+            _chain.RenderGaps(_c, width, height);
+        }
+        else
+        {
+            _chain.RenderChain(_c, width, height);
+        }
+
+        if (_toast is not null) _c.Line(_c.Yellow + _toast + _c.Reset);
+    }
+
+    /// <summary>
+    /// A 键：粘链接补录。用 Console.ReadLine 读一行 —— 用户本来就是在"粘一行 URL"，
+    /// 这比调用剪贴板 API 稳，也避免为一个按键引入 WinForms 依赖。
+    /// 读不到/解析失败/重复都只提示，绝不改动当前列表。
+    /// </summary>
+    private void AddByLink()
+    {
+        _c.Restore();
+        Console.WriteLine();
+        Console.Write("粘贴一棒帖子的链接（opus / 动态 / 视频 BV·av）> ");
+        var input = Console.ReadLine();
+
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            _toast = "没有读到链接（剪贴板为空或输入被取消），列表未改动。";
+            HideCursor();
+            return;
+        }
+
+        var reference = LinkResolver.Resolve(input, out var reason);
+        if (reference is null)
+        {
+            _toast = "补录失败：" + (reason ?? "无法识别该链接") + " 列表未改动。";
+            HideCursor();
+            return;
+        }
+        if (reference.Kind == PostKind.Topic)
+        {
+            _toast = "补录失败：这是话题链接，不是一根棒。请粘某一棒帖子的链接。列表未改动。";
+            HideCursor();
+            return;
+        }
+        if (FindDuplicate(reference.Id) is { } dup)
+        {
+            _toast = $"补录失败：第 {BarTextOf(dup)} 棒 {dup.ResolvedAuthor ?? dup.PosterName} 已在列表里，未重复添加。";
+            HideCursor();
+            return;
+        }
+
+        var logs = new List<string>();
+        try
+        {
+            using var http = new ChainHttp();
+            var reader = new ChainPostReader(http);
+            var facts = reader.Read(reference, m => logs.Add(m), CancellationToken.None);
+            if (facts is null)
+            {
+                _toast = "补录失败：读取器没有返回内容，列表未改动。";
+                HideCursor();
+                return;
+            }
+
+            var item = ToReviewItem(facts, reference);
+            _items.Add(item);
+            SortItems();
+            _index = Visible.IndexOf(item);
+            if (_index < 0)
+            {
+                // 当前正在"只看待确认"以外的过滤状态时，强制回到全部视图，保证新条目可见。
+                _onlyPending = false;
+                _index = Math.Max(0, _items.IndexOf(item));
+            }
+            RecomputeAssertions();
+            _dirty = true;
+            _toast = $"已补录：第 {BarTextOf(item)} 棒 {item.ResolvedAuthor ?? item.PosterName}"
+                     + "（待确认；Enter 确认、S 保存）";
+        }
+        catch (Exception ex)
+        {
+            var detail = ex.Message;
+            if (logs.Count > 0 && !detail.Contains(logs[^1], StringComparison.Ordinal))
+                detail += "（" + logs[^1] + "）";
+            _toast = "补录失败：" + detail + " 列表未改动。";
+        }
+        HideCursor();
+    }
+
+    private ReviewItem? FindDuplicate(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return null;
+        foreach (var it in _items)
+        {
+            if (string.Equals(it.CardId, id, StringComparison.OrdinalIgnoreCase)) return it;
+            if (IdFromUrl(it.OpusUrl) is { } cardId
+                && string.Equals(cardId, id, StringComparison.OrdinalIgnoreCase)) return it;
+        }
+        return null;
+    }
+
+    private static string? IdFromUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+        var m = Regex.Match(url, @"/(?:opus|dynamic)/(\d{6,})");
+        if (m.Success) return m.Groups[1].Value;
+        m = Regex.Match(url, @"(BV[0-9A-Za-z]{10})");
+        if (m.Success) return m.Groups[1].Value;
+        m = Regex.Match(url, @"/video/av(\d+)", RegexOptions.IgnoreCase);
+        if (m.Success) return "av" + m.Groups[1].Value;
+        return null;
+    }
+
+    /// <summary>把读到的一棒事实转成 M4 的待确认记录。Notes 留"来源=补录"，Confirmed 保持 false。</summary>
+    private static ReviewItem ToReviewItem(PostFacts facts, PostRef reference)
+    {
+        var item = new ReviewItem
+        {
+            CardId = string.IsNullOrWhiteSpace(facts.PostId) ? reference.Id : facts.PostId,
+            Bar = facts.BarNumber,
+            BarRaw = facts.BarRaw,
+            IsEx = facts.IsEx,
+            DeclaredTime = facts.DeclaredTime,
+            PubTs = facts.PubTs,
+            PubTimeText = facts.PubLocal == DateTime.MinValue ? "-" : facts.PubLocal.ToString("yyyy-MM-dd HH:mm:ss"),
+            PosterName = facts.AuthorName,
+            PosterMid = facts.AuthorUid,
+            CreatorInText = facts.CreatorInText,
+            ResolvedAuthor = string.IsNullOrWhiteSpace(facts.CreatorInText) ? facts.AuthorName : facts.CreatorInText,
+            PrevName = facts.Prevs.FirstOrDefault()?.Name,
+            NextName = facts.Nexts.FirstOrDefault()?.Name,
+            IsProxy = facts.IsProxy,
+            ProxyName = facts.ProxyName,
+            OpusUrl = string.IsNullOrWhiteSpace(facts.Url) ? reference.Url : facts.Url,
+            Type = facts.Kind.ToString().ToLowerInvariant(),
+            TypeLabel = facts.WorkKindLabel ?? string.Empty,
+            MatchedStyle = "补录",
+            MergedText = string.IsNullOrWhiteSpace(facts.MergedText) ? facts.BodyText : facts.MergedText,
+            Confirmed = false,
+            Ignored = false,
+        };
+
+        item.Notes.Add("来源=补录");
+        if (!string.IsNullOrWhiteSpace(facts.RelayName)) item.Notes.Add("活动=" + facts.RelayName);
+        item.Notes.Add("链接=" + reference.Url);
+        foreach (var w in facts.ReaderWarnings.Take(3)) item.Notes.Add("读取提示：" + w);
+        return item;
+    }
+
+    private static string BarTextOf(ReviewItem item) => item.IsEx ? "EX" : (item.Bar?.ToString() ?? "?");
+
+    private static void HideCursor()
+    {
+        try { Console.CursorVisible = false; } catch { }
     }
 
     private void Move(int delta)
