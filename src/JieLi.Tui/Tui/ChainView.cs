@@ -1,9 +1,10 @@
-#nullable enable
+﻿#nullable enable
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using JieLi.Tui.Chain;
 using JieLi.Tui.Text;
+using JieLi.Tui.Tui.Rendering;
 
 namespace JieLi.Tui.Tui;
 
@@ -43,6 +44,66 @@ public sealed class ChainView
     public ChainResult Result { get; }
 
     public int GapCount => Result.Gaps.Count;
+
+    /// <summary>当前选中的节点（OrderNodes 后的下标）；-1 表示还没进过链条视图。</summary>
+    public int NodeCursor { get; private set; } = -1;
+
+    /// <summary>按 ↓/↑ 移动节点选择。返回是否发生了移动（用于决定要不要重绘）。</summary>
+    public bool MoveNodeCursor(int delta, bool toEnd = false)
+    {
+        var ordered = OrderNodes(Result.Nodes);
+        if (ordered.Count == 0) return false;
+        int before = NodeCursor;
+        int next = toEnd ? ordered.Count - 1 : (NodeCursor < 0 ? 0 : NodeCursor) + delta;
+        NodeCursor = Math.Clamp(next, 0, ordered.Count - 1);
+        return NodeCursor != before;
+    }
+
+    /// <summary>选中节点的详情（喂给 ReviewView 的全文查看器，Esc 返回）。</summary>
+    public string[] NodeDetailLines()
+    {
+        var ordered = OrderNodes(Result.Nodes);
+        if (ordered.Count == 0) return new[] { "（链条里没有节点）" };
+        int i = Math.Clamp(NodeCursor < 0 ? 0 : NodeCursor, 0, ordered.Count - 1);
+        var n = ordered[i];
+        var f = n.Facts;
+        var lines = new List<string>
+        {
+            $"棒号      {BarText(f)}",
+            $"时段      {Blank(f?.DeclaredTime)}",
+            $"创作者    {CreatorOf(f)}",
+            $"代发      {(f is { IsProxy: true } ? Blank(f.ProxyName) : "-")}",
+            $"类型      {Blank(f?.WorkKindLabel)}",
+            $"方向      {DirArrow(n.Direction)}   来源 {SourceLabel(n.Source)}   置信 {(n.Confidence > 0 ? n.Confidence.ToString("0.00") : "-")}",
+            $"帖子ID    {n.Ref.Id}",
+            $"链接      {Blank(f?.Url)}",
+            $"定位      {(n.IsStart ? "★入口" : n.IsSupplement ? "+补录" : "链上节点")} · 深度 {n.Depth}",
+        };
+
+        var rev = ReversePointer(n, ordered, i);
+        if (rev.Text.Length > 0) lines.Add($"@反指     {(rev.Mismatch ? "⚠ " : string.Empty)}{rev.Text}");
+        if (n.Notes.Count > 0) lines.Add("备注      " + string.Join("；", n.Notes));
+        if (n.MatchedBy is { Length: > 0 }) lines.Add("匹配依据  " + n.MatchedBy);
+
+        var gaps = Result.Gaps.Where(g => string.Equals(g.FromPostId, n.Ref.Id, StringComparison.OrdinalIgnoreCase)).ToList();
+        foreach (var g in gaps)
+        {
+            lines.Add(string.Empty);
+            lines.Add($"⚠ 缺口 {DirArrow(g.Direction)} 期望 {ExpectedOf(g)}");
+            lines.Add("  原因 " + g.Reason);
+            if (g.SuggestedCommand is { Length: > 0 } cmd) lines.Add("  补： " + cmd);
+        }
+
+        lines.Add(string.Empty);
+        lines.Add("— 正文（前 12 行，按 ↑↓ 继续滚）—");
+        var body = (f?.MergedText ?? string.Empty).Replace("\r", string.Empty).Split('\n');
+        foreach (var l in body.Where(l => l.Trim().Length > 0).Take(12)) lines.Add(l.Trim());
+        return lines.ToArray();
+    }
+
+    private static string BarText(PostFacts? f) => f is null ? "?" : f.IsEx ? "EX" : (f.BarNumber?.ToString() ?? "?");
+
+    private static string Blank(string? s) => string.IsNullOrWhiteSpace(s) ? "-" : s!;
 
     private ChainView(ChainResult result, string jsonPath)
     {
@@ -121,92 +182,117 @@ public sealed class ChainView
     // 缺口视图（G）
     // -----------------------------------------------------------------------
 
-    public void RenderGaps(ConsoleHost c, int width, int height)
+    public void RenderGaps(FrameBuilder f, string? toast = null)
     {
         var r = Result;
-        c.Line(c.Bold + "缺口清单（只读）" + c.Reset);
-        c.Line(c.Dim + "  chain.json：" + JsonPath + c.Reset);
+        var t = f.Theme;
 
         var info = new StringBuilder("  ");
         if (!string.IsNullOrWhiteSpace(r.RelayName)) info.Append(r.RelayName).Append(" · ");
         info.Append("节点 ").Append(r.Nodes.Count).Append(" · 缺口 ").Append(r.Gaps.Count);
         if (r.Gaps.Count == 0 && r.Nodes.Count > 0) info.Append("（链路完整）");
-        c.Line(c.Dim + info.ToString() + c.Reset);
-        c.Line(c.Dim + ConsoleHost.Rule(width) + c.Reset);
+
+        f.Header(
+            t.Bold("缺口清单（只读）"),
+            t.Muted(TextWidth.Truncate(info.ToString(), f.Width)),
+            t.Muted(TextWidth.Truncate("  chain.json：" + JsonPath, Math.Max(10, f.Width - 2))));
+
+        int bodyH = f.BodyHeight;
+        var tail = new List<string>();
+        if (r.Warnings.Count > 0)
+            tail.Add(t.Warning("⚠ " + TextWidth.Truncate(r.Warnings[0], Math.Max(10, f.Width - 6))));
+        if (!string.IsNullOrWhiteSpace(r.StartPostId))
+            tail.Add(t.Muted("入口帖子：" + r.StartPostId
+                + (string.IsNullOrWhiteSpace(r.Slug) ? string.Empty : "    目录：" + r.Slug)));
 
         if (r.Gaps.Count == 0)
         {
-            c.Line(c.Green + "没有缺口：本次遍历在已知方向上都接上了。" + c.Reset);
+            f.Body(t.Success("没有缺口：本次遍历在已知方向上都接上了。"));
+            f.Body(tail);
+            f.Toast(toast);
+            f.Keys(("Esc", "返回"), ("G", "缺口清单"), ("C", "链条视图"), ("A", "补录"));
+            f.Render();
+            return;
         }
-        else
+
+        // 每处缺口 2~3 行；预留 1 行给截断提示。
+        int budget = Math.Max(1, bodyH - tail.Count - 1);
+        var lines = new List<string>();
+        int shown = 0;
+        for (int i = 0; i < r.Gaps.Count; i++)
         {
-            // 每处缺口 2~3 行；按终端高度截断，避免把页脚顶出屏幕。
-            int maxLines = Math.Max(3, height - 7);
-            int lines = 0;
-            int shown = 0;
-            for (int i = 0; i < r.Gaps.Count; i++)
-            {
-                if (lines + 2 > maxLines) break;
-                var g = r.Gaps[i];
+            var g = r.Gaps[i];
+            int cost = 2 + (g.SuggestedCommand is { Length: > 0 } ? 1 : 0);
+            if (lines.Count + cost > budget) break;
 
-                var line1 = new StringBuilder();
-                line1.Append(c.Yellow).Append('#').Append(i + 1).Append(' ').Append(c.Reset);
-                line1.Append(c.Cyan).Append(DirArrow(g.Direction)).Append(c.Reset).Append(' ');
-                line1.Append(c.Dim).Append(TextWidth.Pad(TextWidth.Truncate(KindLabel(g.Kind), 6), 6)).Append(c.Reset).Append(' ');
-                line1.Append(TextWidth.Truncate("期望 " + ExpectedOf(g), Math.Max(10, width - 22)));
-                c.Line(line1.ToString());
-                lines++;
+            var line1 = new StringBuilder();
+            line1.Append(t.Warning("#" + (i + 1))).Append(' ');
+            line1.Append(t.Accent(DirArrow(g.Direction))).Append(' ');
+            line1.Append(t.Muted(TextWidth.Pad(TextWidth.Truncate(KindLabel(g.Kind), 6), 6))).Append(' ');
+            line1.Append(TextWidth.Truncate("期望 " + ExpectedOf(g), Math.Max(10, f.Width - 22)));
+            lines.Add(line1.ToString());
 
-                var reason = string.IsNullOrWhiteSpace(g.Reason) ? "（未给原因）" : g.Reason!;
-                c.Line("    " + c.Dim + TextWidth.Truncate(reason, Math.Max(10, width - 8)) + c.Reset);
-                lines++;
+            var reason = string.IsNullOrWhiteSpace(g.Reason) ? "（未给原因）" : g.Reason!;
+            lines.Add("    " + t.Muted(TextWidth.Truncate(reason, Math.Max(10, f.Width - 8))));
 
-                if (g.SuggestedCommand is { Length: > 0 } cmd && lines < maxLines)
-                {
-                    c.Line("    " + c.Dim + "补：" + c.Reset + c.Green
-                           + TextWidth.Truncate(cmd, Math.Max(10, width - 8)) + c.Reset);
-                    lines++;
-                }
-                shown++;
-            }
-
-            if (shown < r.Gaps.Count)
-                c.Line(c.Dim + $"  …另有 {r.Gaps.Count - shown} 处缺口未显示（终端高度限制；可用 --report 看全文）" + c.Reset);
+            if (g.SuggestedCommand is { Length: > 0 } cmd)
+                lines.Add("    " + t.Muted("补：") + t.Success(TextWidth.Truncate(cmd, Math.Max(10, f.Width - 8))));
+            shown++;
         }
 
-        if (r.Warnings.Count > 0)
-            c.Line(c.Yellow + "⚠ " + TextWidth.Truncate(r.Warnings[0], Math.Max(10, width - 6)) + c.Reset);
-        if (!string.IsNullOrWhiteSpace(r.StartPostId))
-            c.Line(c.Dim + "入口帖子：" + r.StartPostId
-                  + (string.IsNullOrWhiteSpace(r.Slug) ? string.Empty : "    目录：" + r.Slug) + c.Reset);
-        c.Line(c.Dim + "Esc 返回    G 缺口清单    C 链条视图    补录请回确认列表按 A" + c.Reset);
+        if (shown < r.Gaps.Count)
+            lines.Add(t.Muted($"  …另有 {r.Gaps.Count - shown} 处缺口未显示（终端高度限制；可用 --report 看全文）"));
+
+        f.Body(lines);
+        f.Body(tail);
+        f.Toast(toast);
+        f.Keys(("Esc", "返回"), ("G", "缺口清单"), ("C", "链条视图"), ("A", "补录"));
+        f.Render();
     }
 
     // -----------------------------------------------------------------------
     // 链条视图（C）
     // -----------------------------------------------------------------------
 
-    public void RenderChain(ConsoleHost c, int width, int height)
+    public void RenderChain(FrameBuilder f, string? toast = null)
     {
         var r = Result;
+        var t = f.Theme;
         var ordered = OrderNodes(r.Nodes);
 
-        c.Line(c.Bold + "链条视图（只读）" + c.Reset);
         var info = new StringBuilder("  ");
+        info.Append("选 ").Append(NodeCursor + 1).Append('/').Append(ordered.Count).Append(" · ");
         info.Append("入口 ").Append(string.IsNullOrWhiteSpace(r.StartPostId) ? "-" : r.StartPostId);
         info.Append(" · 节点 ").Append(ordered.Count).Append(" · 缺口 ").Append(r.Gaps.Count);
         info.Append(r.ForwardComplete ? " · 已见末棒" : " · 未见末棒");
         if (!string.IsNullOrWhiteSpace(r.Slug)) info.Append(" · 目录 ").Append(r.Slug);
-        c.Line(c.Dim + info.ToString() + c.Reset);
-        c.Line(c.Dim + "  chain.json：" + JsonPath + c.Reset);
-        c.Line(c.Dim + ConsoleHost.Rule(width) + c.Reset);
 
-        const int wBar = 5, wTime = 6, wSource = 10, wDir = 4, wConf = 6, wRev = 18;
-        int wAuthor = Math.Clamp(width - (wBar + wTime + wSource + wDir + wConf + wRev + 8), 10, 24);
-        c.Line(c.Bold + TextWidth.PadLeft("棒", wBar) + " " + TextWidth.Pad("时段", wTime) + " "
-               + TextWidth.Pad("创作者", wAuthor) + " " + TextWidth.Pad("来源", wSource) + " "
-               + TextWidth.Pad("方向", wDir) + " " + TextWidth.Pad("置信", wConf) + " "
-               + TextWidth.Pad("@反指", wRev) + c.Reset);
+
+        var header = new List<string>
+        {
+            t.Bold("链条视图（只读）"),
+            t.Muted(TextWidth.Truncate(info.ToString(), f.Width)),
+        };
+        // 矮窗口（<26 行）先省掉 chain.json 路径行：正文行比路径更有用。
+        if (f.Height >= 26)
+            header.Add(t.Muted(TextWidth.Truncate("  chain.json：" + JsonPath, Math.Max(10, f.Width - 2))));
+        // 图例放页头而不是表格上方：BodyHeight 会按页头行数自动收缩，省下来的行全给表格。
+        header.Add(t.Muted(TextWidth.Truncate(
+            "★入口 +补录 ←上一棒 →下一棒 ↔双向 ·未知  置信=结构/时间窗  ⚠=与链上相邻棒对不上", f.Width)));
+        f.Header(header.ToArray());
+
+        var table = new TableBuilder(
+            new TableColumn { Header = "棒", Width = 5, RightAlign = true },
+            new TableColumn { Header = "时段", Width = 6 },
+            new TableColumn { Header = "创作者", Width = 20, Min = 8 },
+            new TableColumn { Header = "方向", Width = 4 },
+            new TableColumn { Header = "来源", Width = 10, Priority = Priority.P1, ShowFromWidth = 96 },
+            new TableColumn { Header = "置信", Width = 6, RightAlign = true, Priority = Priority.P2, ShowFromWidth = 96 },
+            new TableColumn { Header = "@反指", Width = 18, Priority = Priority.P3, ShowFromWidth = 120 });
+
+        var w = table.Widths(f.Width, out var keep);
+
+        NodeCursor = ordered.Count == 0 ? -1 : Math.Clamp(NodeCursor < 0 ? 0 : NodeCursor, 0, ordered.Count - 1);
 
         // 从哪个帖子断掉的 → 该行标黄，并在行下补一条缺口摘要（"缺口高亮"）。
         var gapFrom = r.Gaps
@@ -214,32 +300,43 @@ public sealed class ChainView
             .GroupBy(g => g.FromPostId!, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
 
-        int maxRows = Math.Max(4, height - 7);
+        // 主体 = 表头 1 + 行 + 截断提示 + 告警 + 缺口行。
+        int tailCount = (r.Warnings.Count > 0 ? 1 : 0) + (r.Gaps.Count > 0 ? 1 : 0);
+        int maxRows = Math.Max(1, f.BodyHeight - 1 - tailCount - 1);
+
+        f.Body(table.Header(f.Width, t, w, keep));
+
+        // 滚动窗口：让选中节点留在可见区域（按节点下标近似，缺口行会占用额外行）。
+        int start = Math.Max(0, NodeCursor - maxRows + 1);
         int rows = 0;
-        for (int i = 0; i < ordered.Count; i++)
+        for (int i = start; i < ordered.Count; i++)
         {
             if (rows >= maxRows) break;
             var n = ordered[i];
-            var f = n.Facts;
+            var facts = n.Facts;
             bool hasGap = gapFrom.ContainsKey(n.Ref.Id);
-            string rowColor = hasGap ? c.Yellow : (n.IsStart ? c.Cyan : (n.IsSupplement ? c.Magenta : string.Empty));
+            Role? role = i == NodeCursor ? Role.Selected
+                : hasGap ? Role.Warning
+                : n.IsStart ? Role.Accent
+                : n.IsSupplement ? Role.Muted
+                : null;
 
-            var sb = new StringBuilder();
-            sb.Append(rowColor);
-            string bar = f is null ? "?" : f.IsEx ? "EX" : (f.BarNumber?.ToString() ?? "?");
+            string bar = facts is null ? "?" : facts.IsEx ? "EX" : (facts.BarNumber?.ToString() ?? "?");
             string mark = n.IsStart ? "★" : (n.IsSupplement ? "+" : " ");
-            sb.Append(TextWidth.Pad(mark + bar, wBar)).Append(' ');
-            sb.Append(TextWidth.Pad(TextWidth.Truncate(f?.DeclaredTime ?? "-", wTime), wTime)).Append(' ');
-            sb.Append(TextWidth.Pad(TextWidth.Truncate(CreatorOf(f), wAuthor), wAuthor)).Append(' ');
-            sb.Append(TextWidth.Pad(TextWidth.Truncate(SourceLabel(n.Source), wSource), wSource)).Append(' ');
-            sb.Append(TextWidth.Pad(DirArrow(n.Direction), wDir)).Append(' ');
-            sb.Append(TextWidth.Pad(n.Confidence > 0 ? n.Confidence.ToString("0.00") : "-", wConf)).Append(' ');
-
             var rev = ReversePointer(n, ordered, i);
-            if (rev.Mismatch) sb.Append(c.Yellow);
-            sb.Append(TextWidth.Truncate(rev.Text, wRev));
-            sb.Append(c.Reset);
-            c.Line(sb.ToString());
+            var revText = rev.Text.Length == 0 ? string.Empty : (rev.Mismatch ? "⚠" : string.Empty) + rev.Text;
+
+            var cells = new[]
+            {
+                mark + bar,
+                facts?.DeclaredTime ?? "-",
+                CreatorOf(facts),
+                DirArrow(n.Direction),
+                SourceLabel(n.Source),
+                n.Confidence > 0 ? n.Confidence.ToString("0.00") : "-",
+                revText,
+            };
+            f.Body(table.DataRow(cells, w, keep, role, t));
             rows++;
 
             if (hasGap)
@@ -247,34 +344,38 @@ public sealed class ChainView
                 foreach (var g in gapFrom[n.Ref.Id].Take(2))
                 {
                     if (rows >= maxRows) break;
-                    c.Line("    " + c.Yellow + "⚠ 缺口 " + DirArrow(g.Direction) + " 期望 "
-                           + TextWidth.Truncate(ExpectedOf(g), Math.Max(8, width - 26)) + c.Reset);
+                    f.Body("    " + t.Warning("⚠ 缺口 " + DirArrow(g.Direction) + " 期望 "
+                           + TextWidth.Truncate(ExpectedOf(g), Math.Max(8, f.Width - 26))));
                     rows++;
                 }
             }
         }
 
-        if (rows >= maxRows && ordered.Count > 0)
-            c.Line(c.Dim + $"  …另有节点未显示（终端高度限制；按 G 看缺口，或用 --report 看全文）" + c.Reset);
-
-        c.Line(c.Dim + "★入口  +补录  ←上一棒  →下一棒  ↔双向  ·未知  置信=结构/时间窗  "
-               + "@反指=该帖反向 @ 的昵称，⚠=与链上相邻棒对不上" + c.Reset);
+        if (rows >= maxRows && start + rows < ordered.Count)
+            f.Body(t.Muted("  …另有节点未显示（终端高度限制；按 G 看缺口，或用 --report 看全文）"));
         if (r.Warnings.Count > 0)
-            c.Line(c.Yellow + "⚠ " + TextWidth.Truncate(r.Warnings[0], Math.Max(10, width - 6)) + c.Reset);
+            f.Body(t.Warning("⚠ " + TextWidth.Truncate(r.Warnings[0], Math.Max(10, f.Width - 6))));
         if (r.Gaps.Count > 0)
-            c.Line(c.Yellow + $"缺口 {r.Gaps.Count} 处" + c.Reset + c.Dim + "（按 G 查看方向/期望对象/建议命令）" + c.Reset);
-        c.Line(c.Dim + "Esc 返回    G 缺口清单    C 链条视图（重新载入）    A 补录需回确认列表" + c.Reset);
+            f.Body(t.Warning($"缺口 {r.Gaps.Count} 处") + t.Muted("（按 G 查看方向/期望对象/建议命令）"));
+
+        f.Toast(toast);
+        f.Keys(("Esc", "返回"), ("↑↓", "选节点"), ("Enter", "节点详情"), ("G", "缺口清单"), ("C", "重载链条"), ("A", "补录"));
+        f.Render();
     }
 
     /// <summary>没有 chain.json 时的统一提示（G / C 共用）。</summary>
-    public static void RenderUnavailable(ConsoleHost c, string title, string? error, string hint)
+    public static void RenderUnavailable(FrameBuilder f, string title, string? error, string hint, string? toast = null)
     {
-        c.Line(c.Bold + title + "（只读）" + c.Reset);
-        c.Line(c.Yellow + (string.IsNullOrWhiteSpace(error) ? "没有可显示的链条数据。" : error!) + c.Reset);
-        c.Line(c.Dim + ConsoleHost.Rule(Math.Max(20, ConsoleHost.WindowWidth)) + c.Reset);
-        c.Line(c.Dim + "先跑：" + c.Reset + c.Cyan + hint + c.Reset);
-        c.Line(c.Dim + "它会生成 work/<目录名>/chain.json，之后按 G 看缺口、按 C 看链条。" + c.Reset);
-        c.Line(c.Dim + "Esc 返回    G 缺口清单    C 链条视图" + c.Reset);
+        var t = f.Theme;
+        f.Header(
+            t.Bold(title + "（只读）"),
+            t.Warning(string.IsNullOrWhiteSpace(error) ? "没有可显示的链条数据。" : error!));
+
+        f.Body(t.Muted("先跑：") + t.Accent(hint));
+        f.Body(t.Muted("它会生成 work/<目录名>/chain.json，之后按 G 看缺口、按 C 看链条。"));
+        f.Toast(toast);
+        f.Keys(("Esc", "返回"), ("G", "缺口清单"), ("C", "链条视图"));
+        f.Render();
     }
 
     // -----------------------------------------------------------------------

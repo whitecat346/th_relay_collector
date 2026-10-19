@@ -14,4 +14,11 @@
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- 渲染基座：样式/颜色能力检测/表格排版（见 docs/UI-UX-PLAN.md） -->
+    <PackageReference Include="Spectre.Console" Version="0.57.2" />
+    <!-- 终端显示宽度（CJK/emoji 字素簇），替代手写宽度区间表 -->
+    <PackageReference Include="Wcwidth" Version="4.0.1" />
+  </ItemGroup>
+
 </Project>

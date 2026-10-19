@@ -2,6 +2,7 @@
 using JieLi.Tui.Data;
 using JieLi.Tui.Model;
 using JieLi.Tui.Tui;
+using JieLi.Tui.Tui.Rendering;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -107,6 +108,23 @@ public static class Program
                 case "--plain":
                 case "--dump":
                     forcePlain = true;
+                    break;
+                // 渲染验收开关：固定视口 / 关色 / 关备用屏（旧 conhost 或调试器内用）
+                case "--no-color":
+                    Theme.ForceNoColor = true;
+                    break;
+                case "--no-alt-screen":
+                    ConsoleHost.AltScreenEnabled = false;
+                    break;
+                // 字体缺字 / 把 ambiguous 记成 2 列的终端：★ ⚠ → ← ↔ · … ─ 全降级成 ASCII
+                case "--ascii":
+                    ConsoleHost.AsciiOnly = true;
+                    break;
+                case "--width":
+                    if (i + 1 < args.Length && int.TryParse(args[++i], out var forcedW)) ConsoleHost.ForcedWidth = forcedW;
+                    break;
+                case "--height":
+                    if (i + 1 < args.Length && int.TryParse(args[++i], out var forcedH)) ConsoleHost.ForcedHeight = forcedH;
                     break;
                 // 调试用：把一条帖子的读取结果原样 dump 成 JSON（链路遍历接入前的排错入口）
                 case "--probe":
@@ -256,6 +274,7 @@ public static class Program
         var activities = scanner.ScanAll();
 
         var host = new ConsoleHost(forcePlain);
+        host.EnterAltScreen();
         var app = new TuiApp(host, activities, root);
         return app.Run(jumpSlug);
     }
@@ -547,6 +566,7 @@ public static class Program
         var manifest = topicId > 0 ? TopicCollector.LoadManifest(workRoot, topicId) : null;
         var title = manifest?.Name ?? slug ?? topicId.ToString();
         var host = new ConsoleHost(forcePlain);
+        host.EnterAltScreen();
         var view = new ReviewView(host, workRoot, topicId, title, slug);
 
         if (!host.Interactive)
@@ -558,14 +578,20 @@ public static class Program
             return 0;
         }
 
-        while (!view.ShouldExit)
+        try
         {
-            host.BeginFrame();
-            view.Render(ConsoleHost.WindowWidth, ConsoleHost.WindowHeight);
-            host.EndFrame();
-            view.HandleKey(Console.ReadKey(intercept: true));
+            while (!view.ShouldExit)
+            {
+                host.BeginFrame();
+                view.Render(ConsoleHost.WindowWidth, ConsoleHost.WindowHeight);
+                host.EndFrame();
+                view.HandleKey(Console.ReadKey(intercept: true));
+            }
         }
-        host.Restore();
+        finally
+        {
+            host.Restore();   // 异常也不能把用户困在备用屏里
+        }
         return 0;
     }
 
@@ -1318,6 +1344,10 @@ public static class Program
         Console.WriteLine("  --allow-unconfirmed    跳过\"必须人工确认\"闸门（不建议，产物可能不完整）。");
         Console.WriteLine("  --fix-header           回填时把重复的第 6 列「地址」改名「作品链接」（不建议）。");
         Console.WriteLine("  --plain / --dump       纯文本模式（不重绘、不读键盘），用于脚本化验收。");
+        Console.WriteLine("  --no-color             禁用颜色（等价 NO_COLOR）。");
+        Console.WriteLine("  --no-alt-screen        不进备用屏（旧 conhost / 调试器内）。");
+        Console.WriteLine("  --ascii                把 ★ ⚠ → ← ↔ · … ─ 降级成 ASCII（字体缺字时用）。");
+        Console.WriteLine("  --width N --height N   固定视口尺寸（快照与验收用）。");
         Console.WriteLine("  -h / --help            显示本帮助。");
         Console.WriteLine();
         Console.WriteLine("按键（只读审阅）:");
@@ -1328,7 +1358,11 @@ public static class Program
         Console.WriteLine("  Enter 确认   X 忽略   R 撤销");
         Console.WriteLine("  B 棒号   T 时段   U 创作者   K 类型   P 代发者   N 备注");
         Console.WriteLine("  A 粘贴链接补录一棒   G 缺口清单   C 链条视图");
-        Console.WriteLine("  D 浏览器打开作品链接   S 保存   Esc/Q 返回（有改动自动保存）");
+        Console.WriteLine("  V 全文查看器   ? 帮助   D 浏览器打开作品链接   S 保存");
+        Console.WriteLine("  Esc 返回上一级   Q 退出（有未保存改动时先拦一次）");
+        Console.WriteLine();
+        Console.WriteLine("按键（G/C 只读面板）:");
+        Console.WriteLine("  ↑/↓ PgUp/PgDn Home/End 选节点   Enter 节点详情   Esc 返回");
         Console.WriteLine();
         Console.WriteLine("完整手册: relay-tool/docs/USER-GUIDE.md");
         Console.WriteLine("实测语料规律与反模式: relay-tool/docs/CORPUS-FINDINGS.md");

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <LangVersion>latest</LangVersion>
+    <!-- 中文断言消息与快照按 UTF-8 读取，避免 Roslyn 按 ANSI 误解码 -->
+    <CodePage>65001</CodePage>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- 帧快照：用 Spectre 的 TestConsole 把帧渲成纯文本做断言（Step 2 起使用） -->
+    <PackageReference Include="Spectre.Console.Testing" Version="0.57.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\JieLi.Tui\JieLi.Tui.csproj" />
+  </ItemGroup>
+
+</Project>
