@@ -95,12 +95,30 @@ jieli                                     # 只读审阅已有归档（22 个目
 既无棒号也无时段，只靠名册对齐才拿到 29/30 根棒。三级匹配：
 ① 作品链接 opus id ↔ 卡片 id ② 创作者昵称唯一命中 ③ 时段唯一命中；槽位唯一认领。
 
+## 在 Visual Studio 里开发
+
+用 VS 打开**工作目录根**的解决方案文件：
+
+```
+D:\东方接力收集\JieLi.slnx
+```
+
+（VS 2022 17.14+ / 需装 .NET 10 SDK；低版本装不了就直接用命令行。）
+
+- 解决方案只是入口，代码仓库仍然是 `relay-tool/`（它自己带 `.git`，根仓库忽略它）；
+- F5 有两个调试配置：`jieli（自检，离线）` 跑 `--selftest-chain`，`jieli（帮助）` 跑 `--help`；
+- 根目录的 `.editorconfig` 已按本仓库现有风格配好（4 空格、块式 namespace、LF）；
+- 发布 exe 仍请用 `publish.ps1`（自包含单文件），不要用 VS 的发布向导。
+
 ## 构建与发布
 
 ```powershell
 # 开发构建（DOTNET_CLI_HOME 重定向到工作区，因为沙箱不允许写 ~/.templateengine）
 $env:DOTNET_CLI_HOME = "D:\东方接力收集\relay-tool\.dotnet"
 dotnet build relay-tool\src\JieLi.Tui\JieLi.Tui.csproj
+
+# 或者从工作目录根用解决方案构建
+dotnet build JieLi.slnx
 
 # 自包含单文件发布 → relay-tool\publish\jieli.exe（约 70 MB，无需安装 .NET）
 pwsh -File relay-tool\publish.ps1

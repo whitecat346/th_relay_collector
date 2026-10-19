@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "jieli（自检，离线）": {
+      "commandName": "Project",
+      "commandLineArgs": "--selftest-chain"
+    },
+    "jieli（帮助）": {
+      "commandName": "Project",
+      "commandLineArgs": "--help"
+    }
+  }
+}
