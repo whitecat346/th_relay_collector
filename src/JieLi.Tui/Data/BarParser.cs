@@ -42,6 +42,19 @@ public static class BarParser
         RegexOptions.Compiled);
 
     /// <summary>
+    /// 双标注：「5：00 代发：@代发账号 作者：@原作者」。
+    /// 实测 topic 1349127 第 6 棒：「5：00 代发：@龙胆紫苑作者：@Yolandabaka」（作者前无空格）。
+    /// </summary>
+    private static readonly Regex ProxyFirstRegex = new(
+        @"代\s*(?:发|投|发布)\s*[:：]\s*@?\s*(?<proxy>[^\s@<（(、,，|｜:：\n]{1,30}?)\s*作\s*者\s*[:：]\s*@?\s*(?<author>[^\s@<（(、,，|｜:：\n]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>双标注的另一种顺序：「作者：@原作者 代发：@代发账号」。</summary>
+    private static readonly Regex AuthorFirstRegex = new(
+        @"作\s*者\s*[:：]\s*@?\s*(?<author>[^\s@<（(、,，|｜:：\n]{1,30}?)\s*代\s*(?:发|投|发布)\s*[:：]\s*@?\s*(?<proxy>[^\s@<（(、,，|｜:：\n]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>
     /// 声明的创作者**没有被正确 @ 出来**（B站不会渲染成 &lt;a&gt; 标签）。
     /// 写法：「第18棒 19:00 作者：条（咖方代发）」「第一棒0:00可燃冰块」。
     /// 按用户要求归为异常，交人工处理。
@@ -175,8 +188,19 @@ public static class BarParser
         }
 
         // ---- 正文里的创作者（先试 @ 形式，再试"作者：X"与裸名字兜底） ----
+        // 「代发：@A 作者：@B」/「作者：@B 代发：@A」这种双标注先单独认，
+        // 否则 @ 名字会把紧跟的「作者」两个字一起吞掉（实测：@龙胆紫苑作者：@Yolandabaka → "龙胆紫苑作者"）。
+        var pair = ProxyFirstRegex.Match(text);
+        if (!pair.Success) pair = AuthorFirstRegex.Match(text);
+        if (pair.Success)
+        {
+            bar.HasProxyAnnotation = true;
+            bar.ProxyName = TextNormalizer.CleanMention(pair.Groups["proxy"].Value);
+            bar.CreatorInText = TextNormalizer.CleanMention(pair.Groups["author"].Value);
+        }
+
         var who = WhoRegex.Match(text);
-        if (who.Success)
+        if (who.Success && !pair.Success)
             bar.CreatorInText = TextNormalizer.CleanMention(who.Groups["who"].Value);
         else
         {
@@ -199,7 +223,7 @@ public static class BarParser
 
         // ---- 本条的代发标注：「@原作者（某某代发）」 ----
         var proxyForCurrent = ProxyForCurrentRegex.Match(text);
-        if (proxyForCurrent.Success)
+        if (proxyForCurrent.Success && !pair.Success)
         {
             bar.HasProxyAnnotation = true;
             bar.ProxyName = TextNormalizer.CleanMention(proxyForCurrent.Groups["proxy"].Value);

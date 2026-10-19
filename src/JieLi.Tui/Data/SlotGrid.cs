@@ -213,8 +213,11 @@ public static class SlotGrid
             // 否则会把真棒位漏掉、让后面的棒号整体错位一格（实测 17:00 那棒就差点被吞掉）。
             var author = bar.ResolvedAuthor ?? bar.PosterName;
             var hasNeighborMarkers = bar.PrevName is { Length: > 0 } || bar.NextName is { Length: > 0 };
+            // 「同一作者」按**创作者**或**发布者**任一命中都算：代发帖的发布者（主催）本来就会发很多棒，
+            // 所以还要看创作者；反过来一个账号自己发的第二帖（哪怕这次是替人代发）也该按发布者认出来。
             var owner = plan.Slots.FirstOrDefault(s => s.Owner is not null
-                                                      && TextNormalizer.SameName(s.Owner.ResolvedAuthor ?? s.Owner.PosterName, author));
+                                                      && (TextNormalizer.SameName(s.Owner.ResolvedAuthor ?? s.Owner.PosterName, author)
+                                                          || TextNormalizer.SameName(s.Owner.PosterName, bar.PosterName)));
             if (owner is not null && !hasNeighborMarkers)
             {
                 bar.IsDuplicate = true;
