@@ -52,6 +52,8 @@ public static class Program
         int aiBudget = 20;
         bool selfTestChain = false;
         Chain.PostKind? forcedKind = null;
+        // 话题采集默认逐帖补全详情（话题卡面只有首行摘要）；--no-details 可关掉（离线/求快时用）
+        bool fetchDetails = true;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -89,6 +91,9 @@ public static class Program
                     break;
                 case "--allow-unconfirmed":
                     allowUnconfirmed = true;
+                    break;
+                case "--no-details":
+                    fetchDetails = false;
                     break;
                 case "--backfill":
                     backfill = true;
@@ -215,10 +220,10 @@ public static class Program
 
         // 接力链遍历（用户给一棒，双向自动补全整条链）
         if (linkTarget is not null)
-            return RunLink(root, outDir, linkTarget, addLinks, dateArg, hoursArg, asArg, aiFlag, aiYes, aiBudget, forcedKind);
+            return RunLink(root, outDir, linkTarget, addLinks, dateArg, hoursArg, asArg, aiFlag, aiYes, aiBudget, forcedKind, fetchDetails);
 
         if (collectTarget is not null)
-            return RunCollect(root, collectTarget, outDir);
+            return RunCollect(root, collectTarget, outDir, fetchDetails);
         if (parseTarget is not null)
             return RunParse(root, parseTarget, outDir);
 
@@ -226,7 +231,7 @@ public static class Program
             return RunRoster(root, rosterTarget, outDir);
 
         if (pipelineTarget is not null)
-            return RunPipeline(root, pipelineTarget, outDir);
+            return RunPipeline(root, pipelineTarget, outDir, fetchDetails);
 
         // 人工确认视图（M4）
         if (reviewTarget is not null)
@@ -281,7 +286,7 @@ public static class Program
 
     // ------------------------------------------------------------- 采集模式
 
-    private static int RunCollect(string root, string target, string? outDir)
+    private static int RunCollect(string root, string target, string? outDir, bool fetchDetails = true)
     {
         long? topicId = ParseTopicId(target);
         if (topicId is null)
@@ -304,12 +309,25 @@ public static class Program
         {
             var manifest = collector.CollectAsync(topicId.Value, workRoot, Log).GetAwaiter().GetResult();
             Log("");
+            if (fetchDetails)
+            {
+                Log("———— 逐帖补全详情（话题卡片只有首行摘要，必须进详情页） ————");
+                var detail = TopicDetailEnricher.Enrich(workRoot, manifest.TopicId, Log);
+                TopicCollector.ApplyDetailReport(workRoot, manifest.TopicId, detail);
+                manifest.DetailsFetched = detail.Fetched;
+                manifest.DetailsFailed = detail.Failed;
+                if (detail.Failed > 0)
+                    manifest.Warnings.Add($"详情补全 {detail.Failed}/{detail.Total} 条失败（见 posts.jsonl 的 error 字段）");
+                Log("");
+            }
             Log("———— 采集清单 ————");
             Log($"  话题          : {manifest.Name}");
             Log($"  动态数(接口)  : {manifest.DynamicsReported}");
             Log($"  实际抓到      : {manifest.FetchedCards}   翻页 {manifest.Pages} 页");
             Log($"  有正文        : {manifest.EntriesWithText}");
             Log($"  无正文        : {manifest.EntriesWithoutText}");
+            if (fetchDetails)
+                Log($"  详情补全      : 成功 {manifest.DetailsFetched} / 失败 {manifest.DetailsFailed}");
             foreach (var w in manifest.Warnings) Log($"  ⚠ {w}");
             return manifest.Warnings.Count == 0 ? 0 : 1;
         }
@@ -655,7 +673,7 @@ public static class Program
     /// 这是 M4「半自动辅助器」的入口：非交互入口只产出草稿与待确认清单，
     /// 绝不产出最终 CSV/md（最终写出必须经过 TUI 确认，符合设计阶段定下的防线）。
     /// </summary>
-    private static int RunPipeline(string root, string target, string? outDir)
+    private static int RunPipeline(string root, string target, string? outDir, bool fetchDetails = true)
     {
         long? topicId = ParseTopicId(target);
         if (topicId is null) { Console.Error.WriteLine($"无法从「{target}」解析出 topic_id。"); return 2; }
@@ -684,6 +702,16 @@ public static class Program
             Log("  采集异常中止：" + ex.GetType().Name + ": " + ex.Message);
             if (ex.InnerException is not null) Log("  内层：" + ex.InnerException.Message);
             return 4;
+        }
+
+        // 1b) 逐帖补全详情：话题卡片只给首行摘要（desc.text / major.desc / 标题），
+        //     正文段落、评论区、图片卡片里的文字都在各自的详情页里，必须逐帖去取。
+        if (fetchDetails)
+        {
+            Log("");
+            Log("【1b/3】逐帖补全详情（话题卡片只有首行摘要，必须进详情页）");
+            var detail = TopicDetailEnricher.Enrich(workRoot, topicId.Value, m => Log("  " + m));
+            TopicCollector.ApplyDetailReport(workRoot, topicId.Value, detail);
         }
 
         // 2) 解析与交叉校验
@@ -967,7 +995,8 @@ public static class Program
         bool aiFlag,
         bool aiYes,
         int aiBudget,
-        Chain.PostKind? forcedKind = null)
+        Chain.PostKind? forcedKind = null,
+        bool fetchDetails = true)
     {
         using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
         void Log(string m) => w.WriteLine(m);
@@ -992,7 +1021,7 @@ public static class Program
             if (dateArg is not null || hoursArg > 0)
                 Log("提示：话题入口不需要 --date/--hours（活动日由卡片发布时间推断），这些参数被忽略。");
             Log("");
-            return RunPipeline(root, start.Id.ToString(), outDir);
+            return RunPipeline(root, start.Id.ToString(), outDir, fetchDetails);
         }
 
         var supplements = new List<(Chain.PostRef Ref, int? ForcedBar)>();
@@ -1314,6 +1343,7 @@ public static class Program
         Console.WriteLine("  jieli --opus     <opus链接|opus_id>     单链接模式：接力**没建话题**时用（需网络）");
         Console.WriteLine("  jieli --collect  <topic_id|话题链接>    只采集（需网络）");
         Console.WriteLine("  jieli --parse    <topic_id>            只解析校验，打印完整棒表（离线）");
+        Console.WriteLine("  --no-details                           话题采集时不逐帖取详情（快速/离线用；默认会逐帖取）");
         Console.WriteLine("  jieli --roster   <topic_id>            只抽主办总结名册（离线）");
         Console.WriteLine("  jieli --render   <topic_id>            渲染归档产物（需先填 meta.yml）");
         Console.WriteLine("  jieli --backfill [--apply]             旧归档零风险回填（默认干跑）");

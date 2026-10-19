@@ -194,8 +194,10 @@ public static class ArtifactValidator
 
             // 上下棒定位：出现了"上一棒/下一棒"字样，却没有可识别的 @ 提及
             // （用户要求：对方没有被正确 @ 出来 → 归为异常，交人工处理）
+            // 只数**正文**里的标注：评论区闲聊（"上一棒怎么是…"）不算本棒的上下棒。
+            var markerText = b.BodyText ?? b.MergedText ?? string.Empty;
             var markerCount = System.Text.RegularExpressions.Regex.Matches(
-                b.MergedText ?? string.Empty, @"(?:上一棒|下一棒|前一棒|后一棒)").Count;
+                markerText, @"(?:上一棒|下一棒|前一棒|后一棒)").Count;
             var namedCount = (b.PrevName is { Length: > 0 } ? 1 : 0) + (b.NextName is { Length: > 0 } ? 1 : 0);
             if (markerCount > 0 && namedCount < markerCount)
                 b.HasUnlinkedNeighbor = true;

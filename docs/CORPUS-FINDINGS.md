@@ -426,3 +426,40 @@ backward 多出一个假缺口。改为按 `ValueKind` 分派（字符串取原�
 `BuildRows` 把「棒数异常」行同时塞进了 `rows`，而 `BuildCsv`/`BuildMarkdown` 又单独追加了一遍 →
 CSV 里 N/A 行写两遍、md 里同时出现「### 第N/A棒」和「## 棒数异常」两处。修法：`rows` 只装整点棒 + EX，
 异常行只由第二个参数追加。
+
+---
+
+## 十四、话题卡面 ≠ 正文：必须逐帖进详情页 ★（实测于 `topic 1343535` / `topic 1349127`）
+
+话题接口（`x/topic/web/details/cards`）返回的卡片只是**卡面**，不是帖子本身。卡面上能拿到什么：
+
+| 卡类型 | 卡面能拿到的 | 拿不到的 |
+|---|---|---|
+| 动态（`DYNAMIC_TYPE_DRAW/WORD/AV`） | `module_dynamic.desc.text`（正文的**一段**，常常只有首行）、`module_author`、`major.desc`（视频简介开头） | 正文后续段落、图集说明、评论区 |
+| 文章（`MAJOR_TYPE_ARTICLE`） | 标题 + 摘要 | 正文全文 |
+| 视频（`MAJOR_TYPE_ARCHIVE`） | `archive.title` + `archive.desc` 开头 | 简介后半、评论区（很多场次的上下棒就写在评论里） |
+
+实证：`topic 1349127` 的 `cards.jsonl` 里 `merged_text` 平均 80 字上下，而逐帖取详情后
+`posts.jsonl` 汇总出 **94,913 字**（46/46 成功）；`topic 1343535` 是 **22,950 字**（34/34 成功）。
+不取详情时，评论区里的「上一棒/下一棒」、代发说明、图集内的文字全部丢失。
+
+### 三个具体坑
+
+1. **`cards.raw.jsonl` 每一行本身就是 CardItem**，没有 `dynamic_card_item` 之类的外层包装
+   （`{"id_str":"…","type":"DYNAMIC_TYPE_AV","modules":{…}}`）。按外层键名去找目标的代码会
+   一张也匹配不上，然后退化成「一律当 opus 读」——而视频动态的 `opus/<id>` 页面
+   **没有** `__INITIAL_STATE__.detail`（读出来是空壳），于是批量报
+   `ChainFetchException: opus <id> 页面里没有 __INITIAL_STATE__.detail`。
+   正确做法：认顶层 `id_str`；`major.archive.bvid` → 走 `view?bvid`，`major.article.id` → 走 `article/view`。
+2. **hashtag 节点的 `jump_url` 是搜索页**（`search.bilibili.com/all?keyword=…`），不是「帖子里给了链接」。
+   拼进正文会变成 `#东方project#<//search.bilibili.com/all?keyword=…>` 这种噪声，还会污染
+   `Links` 判定。渲染 span 时要跳过 `search.bilibili.com`。
+3. **评论区会把「上一棒/下一棒」当成标注**。`MergedText` 并入评论后，闲聊里的
+   「上一棒怎么是…」会让「有标注但没 @ 对人」的冲突检查误报（实测 33 条假冲突）。
+   修法：`ParsedBar.BodyText` 单独保留正文，冲突检查只数正文里的标记（修后 33 → 5 条真冲突）。
+
+### 结论
+
+话题模式的信息链是：**卡片（索引：id/作者/时间）→ 逐帖详情（正文全文 + 评论）→ 解析**。
+卡面只用于「知道有哪几帖」；任何判定（棒号、时段、上下棒、代发、EX）都应基于详情页文本。
+`--no-details` 保留给离线重放与快速排查，**正式归档不要用它**。

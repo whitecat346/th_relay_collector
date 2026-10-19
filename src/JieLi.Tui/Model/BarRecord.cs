@@ -129,6 +129,12 @@ public sealed class ParsedBar
     /// <summary>命中的棒号/时段写法（A–H），用于验证解析器的覆盖面。</summary>
     public string? MatchedStyle { get; set; }
 
+    /// <summary>
+    /// 帖子**正文**原文（不含评论区）。话题流程会把详情页正文并入 MergedText，
+    /// 评论区里的闲聊（"上一棒怎么是…"）不能当作本棒的上下棒标注，故单独留一份正文。
+    /// </summary>
+    public string? BodyText { get; set; }
+
     /// <summary>该卡片是否带本活动的话题标签（归属判定的最强信号）。</summary>
     public bool HasTopicTag { get; set; }
 

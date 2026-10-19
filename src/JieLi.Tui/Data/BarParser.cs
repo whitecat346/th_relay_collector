@@ -107,6 +107,15 @@ public static class BarParser
 
         var text = TextNormalizer.Normalize(card.MergedText ?? string.Empty);
         bar.MergedText = text;
+        // 正文单独留一份：话题流程的 MergedText 会把评论区并进来，评论区闲聊不能当上下棒标注。
+        foreach (var key in new[] { "detail.body", "opus.body" })
+        {
+            if (card.TextSources.TryGetValue(key, out var body) && !string.IsNullOrWhiteSpace(body))
+            {
+                bar.BodyText = TextNormalizer.Normalize(body);
+                break;
+            }
+        }
         bar.HasTopicTag = !string.IsNullOrEmpty(topicTag) && text.Contains(topicTag, StringComparison.Ordinal);
         bar.WorkKindLabel = InferWorkKind(card.Type, text);
         if (string.IsNullOrWhiteSpace(text))

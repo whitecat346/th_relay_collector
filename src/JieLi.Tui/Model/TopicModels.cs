@@ -120,6 +120,12 @@ public sealed class TopicCard
     /// <summary>全部来源按优先级顺序拼接后的正文（供解析层做单次正则）。</summary>
     public string MergedText { get; set; } = string.Empty;
 
+    /// <summary>详情页地址（posts.jsonl 补全后才有：opus / 视频 BV / 专栏 cv）。</summary>
+    public string DetailUrl { get; set; } = string.Empty;
+
+    /// <summary>详情页是否已成功读取（posts.jsonl 里 error 为空）。</summary>
+    public bool DetailFetched { get; set; }
+
     public string OpusUrl => string.IsNullOrEmpty(Id) ? string.Empty : $"https://www.bilibili.com/opus/{Id}";
     public string SpaceUrl => AuthorMid > 0 ? $"https://space.bilibili.com/{AuthorMid}" : string.Empty;
 }

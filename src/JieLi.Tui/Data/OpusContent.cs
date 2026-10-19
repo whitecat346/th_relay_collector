@@ -74,8 +74,10 @@ public sealed class OpusContent
                 sb.Append('@').Append(s.AtName ?? s.AtMid);
             else
                 sb.Append(s.Text);
-            if (s.JumpUrl is { Length: > 0 })
-                sb.Append('<').Append(s.JumpUrl).Append('>');
+            // hashtag 节点的 jump_url 是搜索页（search.bilibili.com），不是"帖子里给了链接"，
+            // 拼进正文只会污染文本（也会被当成外链）；只保留真正指向用户/视频/文章的跳转。
+            if (s.JumpUrl is { Length: > 0 } url && !url.Contains("search.bilibili.com", StringComparison.OrdinalIgnoreCase))
+                sb.Append('<').Append(url).Append('>');
         }
         return sb.ToString();
     }

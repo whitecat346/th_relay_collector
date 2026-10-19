@@ -20,6 +20,9 @@ public sealed class CollectManifest
     public int Pages { get; set; }
     public int EntriesWithText { get; set; }
     public int EntriesWithoutText { get; set; }
+    /// <summary>逐帖详情补全：成功 / 失败条数（posts.jsonl）。</summary>
+    public int DetailsFetched { get; set; }
+    public int DetailsFailed { get; set; }
     public string CollectedAt { get; set; } = string.Empty;
     public List<string> Warnings { get; set; } = new();
 }
@@ -135,8 +138,74 @@ public sealed class TopicCollector
 
     // ---------------------------------------------------------------- 离线重放
 
-    /// <summary>从 work/&lt;topicId&gt;/cards.jsonl 读回归一化卡片（离线，不联网）。</summary>
+    /// <summary>
+    /// 从 work/&lt;topicId&gt;/cards.jsonl 读回归一化卡片（离线，不联网）。
+    /// 如果同一目录下有 posts.jsonl（逐帖详情补全的产物），把正文段落与评论并入
+    /// TextSources（detail.body / detail.comments）并重算 MergedText —— 解析层因此
+    /// 能看到「卡面首行」之外的完整信息。
+    /// </summary>
     public static List<TopicCard> LoadCards(string workRoot, long topicId)
+    {
+        var list = LoadCardsWithoutDetails(workRoot, topicId);
+
+        var postsPath = Path.Combine(workRoot, topicId.ToString(), "posts.jsonl");
+        if (File.Exists(postsPath))
+        {
+            var byId = new Dictionary<string, TopicCard>(StringComparer.Ordinal);
+            foreach (var c in list)
+                if (!string.IsNullOrEmpty(c.Id)) byId[c.Id] = c;
+
+            foreach (var line in File.ReadLines(postsPath))
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                var id = GetString(root, "card_id");
+                if (!byId.TryGetValue(id, out var card)) continue;
+
+                card.DetailUrl = GetString(root, "url");
+                card.DetailFetched = string.IsNullOrEmpty(GetString(root, "error"));
+
+                var body = GetString(root, "body_text");
+                if (!string.IsNullOrWhiteSpace(body)) card.TextSources["detail.body"] = body;
+
+                var comments = GetString(root, "comments_text");
+                if (!string.IsNullOrWhiteSpace(comments)) card.TextSources["detail.comments"] = comments;
+            }
+
+            foreach (var card in list) card.MergedText = ComposeMerged(card);
+        }
+
+        return list;
+    }
+
+    /// <summary>把正文、卡面文字、评论按优先级拼成 MergedText，并去掉重复内容。</summary>
+    private static string ComposeMerged(TopicCard card)
+    {
+        var parts = new List<string>();
+        var seen = new List<string>();
+
+        void Add(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            var t = text.Trim();
+            // 卡面文字通常只是正文首行的摘要，重复时不再追加（否则同一句「第N棒」出现两次）
+            if (t.Length >= 8 && seen.Any(s => s.Contains(t, StringComparison.Ordinal))) return;
+            if (seen.Any(s => s.Contains(t, StringComparison.Ordinal) && t.Length * 2 < s.Length)) return;
+            parts.Add(t);
+            seen.Add(t);
+        }
+
+        if (card.TextSources.TryGetValue("detail.body", out var body)) Add(body);
+        foreach (var kv in card.TextSources)
+            if (kv.Key is not ("detail.body" or "detail.comments")) Add(kv.Value);
+        if (card.TextSources.TryGetValue("detail.comments", out var comments)) Add(comments);
+
+        return string.Join(" ⏎ ", parts);
+    }
+
+    /// <summary>只读 cards.jsonl，不合并 posts.jsonl（采集/补全阶段用，避免自己读自己刚写的派生数据）。</summary>
+    public static List<TopicCard> LoadCardsWithoutDetails(string workRoot, long topicId)
     {
         var path = Path.Combine(workRoot, topicId.ToString(), "cards.jsonl");
         if (!File.Exists(path))
@@ -241,6 +310,20 @@ public sealed class TopicCollector
                 time = i.Time,
                 reason = i.Reason,
             }, JsonlOut));
+    }
+
+    /// <summary>把「逐帖详情补全」的统计回写到 subject.json（采集清单）。</summary>
+    public static void ApplyDetailReport(string workRoot, long topicId, TopicDetailReport report)
+    {
+        var path = Path.Combine(workRoot, topicId.ToString(), "subject.json");
+        if (!File.Exists(path)) return;
+        var manifest = JsonSerializer.Deserialize<CollectManifest>(File.ReadAllText(path));
+        if (manifest is null) return;
+        manifest.DetailsFetched = report.Fetched;
+        manifest.DetailsFailed = report.Failed;
+        if (report.Failed > 0)
+            manifest.Warnings.Add($"详情补全 {report.Failed}/{report.Total} 条失败（见 posts.jsonl 的 error 字段）");
+        File.WriteAllText(path, JsonSerializer.Serialize(manifest, PrettyOut), new UTF8Encoding(false));
     }
 
     private static string GetString(JsonElement e, string name)        => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? string.Empty : string.Empty;
