@@ -1,5 +1,6 @@
 #nullable enable
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -23,6 +24,20 @@ public sealed class ChainHttpOptions
 
     /// <summary>单次请求超时。</summary>
     public int TimeoutSeconds { get; init; } = 30;
+
+    /// <summary>
+    /// 是否先初始化「像浏览器」的会话 cookie（访问首页让服务器种 buvid3/b_nut）。
+    /// **默认关**：实测（2026-10-19，同一台机器同一 IP，相隔数秒）只要带着这套 cookie 请求
+    /// 搜索接口就 100% 吃 v_voucher，而完全不带 cookie 的裸请求反而稳定返回结果。
+    /// 推测是「只带了 buvid3/b_nut 却缺 buvid4/_uuid/b_lsid 等其余指纹」这种**残缺组合**被判定异常。
+    /// 需要时用环境变量 JIELI_SESSION=1 打开（例如将来补全整套指纹再试）。
+    /// </summary>
+    public bool UseSessionCookies { get; init; }
+
+    /// <summary>
+    /// 是否对 /wbi/ 端点做 wbi 签名（环境变量 JIELI_WBI=0 可关）。
+    /// </summary>
+    public bool UseWbiSign { get; init; } = true;
 }
 
 /// <summary>
@@ -38,27 +53,56 @@ public sealed class ChainHttpOptions
 /// </summary>
 public sealed class ChainHttp : IDisposable
 {
+    /// <summary>
+    /// 浏览器 UA。用户实测「浏览器访问正常、exe 被风控」——Chrome 126 的 UA 本身没问题，
+    /// 但只带 UA 是不够的：还要补齐 sec-ch-ua / sec-fetch-* 这一套、拿到 buvid3/buvid4 这类
+    /// 设备指纹 cookie、并对 /wbi/ 端点做 wbi 签名，才更像真实浏览器。
+    /// </summary>
     private const string UserAgent =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+    private const string SecChUa =
+        "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"";
 
     private readonly HttpClient _http;
+    private readonly HttpClientHandler _handler;
     private readonly ChainHttpOptions _opt;
     private readonly Random _rng = new();
     private DateTime _lastUtc = DateTime.MinValue;
     private bool _hasRequested;
 
+    /// <summary>会话 cookie（buvid3/buvid4/b_nut）是否已初始化。</summary>
+    private bool _sessionReady;
+
+    /// <summary>wbi 混淆键（img_key+sub_key 混合后的 32 位）。null = 还没取到。</summary>
+    private string? _wbiMixin;
+    private DateTime _wbiFetchedUtc = DateTime.MinValue;
+
+    private bool _useSession = true;
+    private bool _useWbi = true;
+
     public ChainHttp(ChainHttpOptions? options = null)
     {
         _opt = options ?? new ChainHttpOptions();
-        var handler = new HttpClientHandler
+        // 便于现场排障：环境变量可关掉「会话 cookie / wbi 签名」这两项实验性行为
+        if (Environment.GetEnvironmentVariable("JIELI_SESSION") == "0") _useSession = false;
+        if (Environment.GetEnvironmentVariable("JIELI_WBI") == "0") _useWbi = false;
+        _useSession = _useSession && _opt.UseSessionCookies;
+        _useWbi = _useWbi && _opt.UseWbiSign;
+
+        _handler = new HttpClientHandler
         {
             AutomaticDecompression = DecompressionMethods.All,
             UseCookies = true,
         };
-        _http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(_opt.TimeoutSeconds) };
+        _http = new HttpClient(_handler) { Timeout = TimeSpan.FromSeconds(_opt.TimeoutSeconds) };
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", UserAgent);
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Origin", "https://www.bilibili.com");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-ch-ua", SecChUa);
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-ch-ua-mobile", "?0");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-ch-ua-platform", "\"Windows\"");
+        // 注意：**GET 不发 Origin**。浏览器只在跨域 POST/部分 CORS 请求上带 Origin，
+        // 每个匿名 GET 都带 Origin 反而是很显眼的机器人特征（早先版本一直带着）。
 
         var cookie = LoadCookie(_opt.CookiePath);
         if (cookie is { Length: > 0 })
@@ -148,11 +192,34 @@ public sealed class ChainHttp : IDisposable
 
     private string GetOnce(string url, string? referer, CancellationToken ct)
     {
+        // ① 先确保会话 cookie 与 wbi 键就绪（只做一次，失败也只是退化成"裸请求"，不阻断）
+        if (_useSession) EnsureSession(ct);
+        var target = url;
+        if (_useWbi && url.Contains("/wbi/", StringComparison.Ordinal))
+            target = SignWbiIfPossible(url, ct);
+
         Throttle(ct);
-        using var req = new HttpRequestMessage(HttpMethod.Get, url);
-        req.Headers.Referrer = new Uri(referer ?? "https://www.bilibili.com/");
-        if (url.Contains("/opus/", StringComparison.Ordinal))
-            req.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,*/*");
+        using var req = new HttpRequestMessage(HttpMethod.Get, target);
+        var isDoc = url.Contains("/opus/", StringComparison.Ordinal) || !url.Contains("api.bilibili.com", StringComparison.Ordinal);
+        if (isDoc)
+        {
+            // 文档请求（opus 页）：按浏览器导航的样子发
+            req.Headers.Referrer = new Uri(referer ?? "https://www.bilibili.com/");
+            req.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+            req.Headers.TryAddWithoutValidation("Upgrade-Insecure-Requests", "1");
+            req.Headers.TryAddWithoutValidation("sec-fetch-dest", "document");
+            req.Headers.TryAddWithoutValidation("sec-fetch-mode", "navigate");
+            req.Headers.TryAddWithoutValidation("sec-fetch-site", "none");
+            req.Headers.TryAddWithoutValidation("sec-fetch-user", "?1");
+        }
+        else
+        {
+            req.Headers.Referrer = new Uri(referer ?? "https://www.bilibili.com/");
+            req.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
+            req.Headers.TryAddWithoutValidation("sec-fetch-dest", "empty");
+            req.Headers.TryAddWithoutValidation("sec-fetch-mode", "cors");
+            req.Headers.TryAddWithoutValidation("sec-fetch-site", "same-site");
+        }
 
         using var resp = _http.Send(req, HttpCompletionOption.ResponseContentRead, ct);
         var body = resp.Content.ReadAsStringAsync(ct).GetAwaiter().GetResult();
@@ -163,6 +230,144 @@ public sealed class ChainHttp : IDisposable
             throw new ChainHttpStatusException((int)resp.StatusCode, resp.ReasonPhrase, url, body);
         return body;
     }
+
+    // ---------------------------------------------------------------- 会话与 wbi
+
+    /// <summary>
+    /// 初始化「像浏览器」的会话：先访问一次首页拿 buvid3/b_nut，再向官方设备指纹接口要
+    /// buvid3/buvid4 并写进 cookie 容器。只做一次；任何失败都只记一次日志、继续裸请求。
+    /// 为什么这么做：用户实测浏览器访问正常而 exe 被风控，差异之一就是浏览器有这套指纹 cookie。
+    /// </summary>
+    private void EnsureSession(CancellationToken ct)
+    {
+        if (_sessionReady) return;
+        _sessionReady = true;
+        try
+        {
+            using var home = new HttpRequestMessage(HttpMethod.Get, "https://www.bilibili.com/");
+            home.Headers.Referrer = new Uri("https://www.bilibili.com/");
+            home.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+            home.Headers.TryAddWithoutValidation("sec-fetch-dest", "document");
+            home.Headers.TryAddWithoutValidation("sec-fetch-mode", "navigate");
+            home.Headers.TryAddWithoutValidation("sec-fetch-site", "none");
+            using var resp = _http.Send(home, HttpCompletionOption.ResponseHeadersRead, ct);
+            resp.Content.ReadAsStringAsync(ct).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            SessionNote = $"首页会话初始化失败（继续裸请求）：{ex.Message}";
+        }
+
+        // ⚠ 刻意**不**调用 x/frontend/finger/spi 去注入 buvid3/buvid4。
+        // 实测（同一台机器、同一 IP、相隔数秒）：
+        //   A 注入 buvid + wbi 签名  → v_voucher
+        //   B 只做 wbi 签名（不注入）→ 正常返回 9 条
+        //   C 注入 buvid（不签名）   → v_voucher
+        //   D 都不做（只补浏览器头） → 正常返回 9 条
+        // 原因是首页已经给 .bilibili.com 域种了 buvid3/b_nut，再对 www/api 子域补一份同名的
+        // 就会在 Cookie 头里出现重复 buvid3 —— 这是非常显眼的异常特征，直接被挑战。
+        // 结论：只用首页自然种下的 cookie，绝不手工拼 buvid。
+    }
+
+    /// <summary>会话初始化的人话结论（进日志/报告用）。</summary>
+    public string? SessionNote { get; private set; }
+
+    /// <summary>
+    /// 对 /wbi/ 端点做 wbi 签名（wts + w_rid）。浏览器会对这些接口签名，未签名的匿名请求
+    /// 更容易被风控挑战（实测 v_voucher）。取不到键时原样返回，不阻断请求。
+    /// </summary>
+    private string SignWbiIfPossible(string url, CancellationToken ct)
+    {
+        var mixin = EnsureWbi(ct);
+        if (mixin is null) return url;
+
+        var qIndex = url.IndexOf('?');
+        var basePart = qIndex < 0 ? url : url[..qIndex];
+        var query = qIndex < 0 ? "" : url[(qIndex + 1)..];
+
+        var pairs = new List<KeyValuePair<string, string>>();
+        foreach (var kv in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var eq = kv.IndexOf('=');
+            var k = eq < 0 ? kv : kv[..eq];
+            var v = eq < 0 ? "" : kv[(eq + 1)..];
+            pairs.Add(new KeyValuePair<string, string>(
+                Uri.UnescapeDataString(k), Uri.UnescapeDataString(v)));
+        }
+        pairs.RemoveAll(p => p.Key is "w_rid" or "wts");
+        pairs.Add(new KeyValuePair<string, string>("wts",
+            DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture)));
+        pairs.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+
+        var sb = new StringBuilder();
+        foreach (var p in pairs)
+        {
+            var value = new string(p.Value.Where(c => c is not ('!' or '\'' or '(' or ')' or '*')).ToArray());
+            if (sb.Length > 0) sb.Append('&');
+            sb.Append(Uri.EscapeDataString(p.Key)).Append('=').Append(Uri.EscapeDataString(value));
+        }
+        var queryForSign = sb.ToString();
+        var sign = Md5Hex(queryForSign + mixin);
+        return $"{basePart}?{queryForSign}&w_rid={sign}";
+    }
+
+    /// <summary>取 wbi 混淆键（缓存 30 分钟）。nav 接口匿名可用，返回 wbi_img 的 img/sub key。</summary>
+    private string? EnsureWbi(CancellationToken ct)
+    {
+        if (_wbiMixin is not null && (DateTime.UtcNow - _wbiFetchedUtc).TotalMinutes < 30) return _wbiMixin;
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, "https://api.bilibili.com/x/web-interface/nav");
+            req.Headers.Referrer = new Uri("https://www.bilibili.com/");
+            req.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
+            using var resp = _http.Send(req, HttpCompletionOption.ResponseContentRead, ct);
+            var json = resp.Content.ReadAsStringAsync(ct).GetAwaiter().GetResult();
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("data", out var data)
+                || !data.TryGetProperty("wbi_img", out var img)
+                || img.ValueKind != JsonValueKind.Object) return _wbiMixin;
+
+            var imgKey = FileKeyOf(img, "img_url");
+            var subKey = FileKeyOf(img, "sub_url");
+            if (imgKey.Length < 32 || subKey.Length < 32) return _wbiMixin;
+
+            var raw = imgKey + subKey;
+            var sb = new StringBuilder(32);
+            foreach (var idx in WbiMixinTab) sb.Append(raw[idx]);
+            _wbiMixin = sb.ToString();
+            _wbiFetchedUtc = DateTime.UtcNow;
+            return _wbiMixin;
+        }
+        catch
+        {
+            return _wbiMixin; // 拿不到就让请求裸奔，不阻断
+        }
+    }
+
+    private static string FileKeyOf(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var v) || v.ValueKind != JsonValueKind.String) return "";
+        var url = v.GetString() ?? "";
+        var slash = url.LastIndexOf('/');
+        var file = slash >= 0 ? url[(slash + 1)..] : url;
+        var dot = file.IndexOf('.');
+        return dot > 0 ? file[..dot] : file;
+    }
+
+    private static string Md5Hex(string text)
+    {
+        var bytes = System.Security.Cryptography.MD5.HashData(Encoding.UTF8.GetBytes(text));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
+
+    /// <summary>bilibili wbi 混淆表（社区公开常量，与浏览器行为一致）。</summary>
+    private static readonly int[] WbiMixinTab =
+    {
+        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+        33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61,
+        26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36,
+        20, 34, 44, 52,
+    };
 
     private void Throttle(CancellationToken ct)
     {

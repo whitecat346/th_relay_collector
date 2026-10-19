@@ -330,6 +330,14 @@ public interface IUserLocator
 
     /// <summary>在用户空间里找窗口内的候选帖子（不确认是不是那一棒，确认交给 MatchVerifier）。</summary>
     IReadOnlyList<PostCandidate> FindPosts(UserRef user, RelayQuery query, Action<string>? log, CancellationToken ct);
+
+    /// <summary>
+    /// 告知本次接力的 topic_id，便于实现方建立「话题卡片索引」。
+    /// 为什么重要：话题卡片接口（x/topic/web/details/cards）匿名可用且不给风控挑战，
+    /// 一次拉全 46 张卡就能拿到「名字 → uid → 帖子」的完整表，**完全不需要搜索接口**。
+    /// 无话题时传 null，实现方应退化为纯搜索路径。
+    /// </summary>
+    void PrimeTopic(long? topicId);
 }
 
 /// <summary>AI 辅助判定的请求（只发片段，绝不发整页 HTML）。</summary>

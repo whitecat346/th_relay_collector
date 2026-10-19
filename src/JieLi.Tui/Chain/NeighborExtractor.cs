@@ -63,6 +63,21 @@ public static class NeighborExtractor
     private static readonly Regex PointBarRegex = new(
         @"(?<![\d:])(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*点\s*棒", RegexOptions.Compiled);
 
+    /// <summary>
+    /// 行首的时段 + 下一个接棒人：「17:00 @茶猫祈祷中」。
+    /// 实测这一场（topic 1349127）全场的棒次都是这么写的：**没有「第N棒」，只有时段 + @**。
+    /// 约束：必须在本行开头（允许缩进/前置符号），后面紧跟 @ 或至少空白；
+    /// 这样不会把视频时长（01:58）或正文里的时钟（23:00 睡觉）误当成本棒时段。
+    /// </summary>
+    private static readonly Regex LineStartSlotRegex = new(
+        @"(?m)^[ \t　]*(?:第)?(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?:棒)?[ \t　]*(?=@|＠)",
+        RegexOptions.Compiled);
+
+    /// <summary>行首时段后面没有 @、但跟着「棒」或「|」的写法：「17:00 | ...」「17:00棒」。</summary>
+    private static readonly Regex LineStartSlotLooseRegex = new(
+        @"(?m)^[ \t　]*(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?:棒|[|｜丨])",
+        RegexOptions.Compiled);
+
     private static readonly Regex LastMarkRegex = new(
         @"(?<kw>最后一棒|最后1棒|末棒|终棒|收官|收尾|完结)", RegexOptions.Compiled);
 
@@ -306,6 +321,18 @@ public static class NeighborExtractor
         if (pointBar.Success)
         {
             return TextNormalizer.NormalizeTime(pointBar.Groups["h"].Value, pointBar.Groups["m"].Value);
+        }
+
+        // 本场（topic 1349127 一类）的写法：第一行就是「17:00 @下一个人」，没有「第N棒」。
+        var slot = LineStartSlotRegex.Match(selfText);
+        if (slot.Success)
+        {
+            return TextNormalizer.NormalizeTime(slot.Groups["h"].Value, slot.Groups["m"].Value);
+        }
+        var slotLoose = LineStartSlotLooseRegex.Match(selfText);
+        if (slotLoose.Success)
+        {
+            return TextNormalizer.NormalizeTime(slotLoose.Groups["h"].Value, slotLoose.Groups["m"].Value);
         }
 
         // 标题里没有【…】时，如果标题本身写成「第8棒 14:00 …」也能吃到棒后时段：

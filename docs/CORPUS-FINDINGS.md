@@ -192,3 +192,72 @@ https://www.bilibili.com/opus/1251685757239689233
 必须**只检查已知棒位之间的空隙**，否则只给 1 条第27棒时会误报"缺棒 26"。
 TUI 里的断言回执（`ReviewView.RecomputeAssertions`）用的也是同一口径。
 
+
+## 十、风控（v_voucher）与「话题索引」这条免死路 ★
+
+### 症状
+搜索接口 `x/web-interface/wbi/search/type` 在同一进程里**只痛快回第一次**，之后返回：
+
+```json
+{"code":0,"data":{"v_voucher":"voucher_..."}}
+```
+
+`code=0` 但 `data` 里没有 `result` —— **不是「没搜到」，是被挑战了**。
+`voucher` 值是随机的，同一台机器用 python 连打 12 次却全部正常，
+说明这不是 IP/速率级封禁，而是**请求指纹级别**的挑战。
+
+### 决定性对照实验（同一构建、相隔数秒）
+
+| 组 | 会话 cookie | WBI 签名 | 结果 |
+|---|---|---|---|
+| A | 注入 buvid3/buvid4（`x/frontend/finger/spi`） | 有 | **v_voucher** |
+| B | 无 | 有 | 正常 9 条 |
+| C | 注入 buvid | 无 | **v_voucher** |
+| D | 无 | 无（只补浏览器头） | 正常 9 条 |
+
+**结论：手工注入 buvid 就是触发器。** 首页（`www.bilibili.com`）已经给 `.bilibili.com`
+种过 `buvid3`/`b_nut`，再对 www/api 子域补同名 cookie → Cookie 头里出现**重复的 buvid3**，
+这是最异常的指纹。删掉注入后仍会被挑战（因为首页那次 GET 本身也带回了 cookie），
+最终定案：**默认完全无 cookie**（`JIELI_SESSION=0` 两跑两正常，`=1` 两跑两 voucher）。
+
+### 最终采用的请求特征（`ChainHttp.cs`）
+
+- UA：真实 Chrome 131 全串；配套 `sec-ch-ua` / `sec-ch-ua-mobile` / `sec-ch-ua-platform`、
+  `sec-fetch-dest|mode|site|user`、文档请求加 `Upgrade-Insecure-Requests`。
+- **GET 不发 `Origin`**（原来每个请求都带 Origin，浏览器不会这么做）。
+- 文档请求（opus 页等）用 `navigate` 头，API 请求用 `cors` 头。
+- `/wbi/` 端点自动签名：`wts` + `w_rid = md5(排序后的 query + mixin_key)`，
+  参数值先过滤 `!'()*`；`mixin_key` 来自 `x/web-interface/nav` 的 `wbi_img` 文件名，
+  按 64 项混淆表重排取前 32 位，缓存 30 分钟。
+- 搜索被挑战后**本轮熔断**（`SearchClient.ShortCircuit`），后续步骤直接跳过搜索，
+  不再浪费请求去撞墙。
+
+### 话题索引：完全不碰搜索接口
+
+`x/topic/web/details/top?topic_id=` + `x/topic/web/details/cards?topic_id=&sort_by=3&page_size=20`
+（offset 游标翻页）匿名可用，每张卡给：
+
+`id_str`（帖 id）、`module_author{mid,name,pub_ts}`、`module_dynamic.desc.text`、
+`major{type, archive.bvid, article.id}` —— **视频卡直接给 bvid，专栏卡给 cv 号**。
+
+实测话题 `1349127`（十月八日は博麗霊夢の永遠の巫女就任日）：**46 张卡 / 33 个作者，零搜索请求**，
+一次 `--link` 就能铺出 13:30→24:00 共 18 棒（含 4 个视频棒）。
+
+### 代发棒只能靠「正文点名」
+
+同一场里 17:00 那棒是**龙胆紫苑代发**，正文写 `17:00 @茶猫祈祷中`，
+作者是代发账号 —— 按作者名/uid 永远找不到。解法是 `TopicIndex.FindByMention(name)`：
+在卡面正文里找 `@名字`，唯一作者就当作代发者继续走，`Why` 里写明
+「话题卡片正文点名「X」（发布者 Y，可能是代发）」。
+
+### 视频帖的评论 `jump_url` 可能是对象
+
+`content.jump_url{占位符}` 的值**不一定是字符串**，视频/专栏卡占位符是对象：
+
+```
+System.InvalidOperationException: The requested operation requires an element of type 'String',
+but the target element has type 'Object'.
+```
+
+原代码直接 `GetString()` → 实测让视频帖 `BV1iapN6KEtk`（13:30 那棒）整条读取失败、
+backward 多出一个假缺口。改为按 `ValueKind` 分派（字符串取原值，对象取 `url`/`jump_url`）。

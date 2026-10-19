@@ -364,10 +364,24 @@ public static class OpusContentExtractor
             }
 
             // 链接：message 里是占位符，实际 URL 在 jump_url{} 的值里
+            // 注意：视频/专栏卡片类的占位符，值是 **对象**（如 {"url":...}），不是字符串。
+            // 早先直接 GetString() 会在这种评论上抛
+            // InvalidOperationException: requires an element of type 'String', but ... 'Object'，
+            // 导致整条视频帖读取失败（实测 BV1iapN6KEtk 就是这么漏掉的）。
             var urlByPlaceholder = new Dictionary<string, string>(StringComparer.Ordinal);
             if (c.TryGetProperty("jump_url", out var ju) && ju.ValueKind == JsonValueKind.Object)
+            {
                 foreach (var p in ju.EnumerateObject())
-                    urlByPlaceholder[p.Name] = p.Value.GetString() ?? string.Empty;
+                {
+                    var value = p.Value.ValueKind switch
+                    {
+                        JsonValueKind.String => p.Value.GetString() ?? string.Empty,
+                        JsonValueKind.Object => Str(p.Value, "url") ?? Str(p.Value, "jump_url") ?? string.Empty,
+                        _ => string.Empty,
+                    };
+                    urlByPlaceholder[p.Name] = value;
+                }
+            }
 
             SplitCommentMessage(message, atByPlaceholder, urlByPlaceholder, item.Spans);
         }

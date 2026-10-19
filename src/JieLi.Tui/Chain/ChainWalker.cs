@@ -104,6 +104,11 @@ public sealed class ChainWalker
             query.RelayName = InferRelayNameFromTitle(startFacts.Title);
         result.RelayName = query.RelayName;
 
+        // 话题 id 一旦已知就告知定位器，让它建立「名字→uid→帖子」索引。
+        // 这条索引完全绕开搜索接口（搜索会被 v_voucher 挑战），是本轮修复风控问题的核心。
+        if (query.TopicId is null && startFacts.TopicId is { } startTopic) query.TopicId = startTopic;
+        _locator.PrimeTopic(query.TopicId);
+
         var startNode = new ChainNode
         {
             Ref = start,
@@ -302,6 +307,14 @@ public sealed class ChainWalker
         node.Ref = new PostRef { Kind = facts.Kind, Id = key };
         node.Facts = facts;
         if (string.IsNullOrWhiteSpace(facts.Url)) facts.Url = node.Ref.Url;
+
+        // 中途某一棒才带话题标签时（入口视频/动态常见），这里补上，让后续邻居定位走话题索引。
+        if (ctx.Query.TopicId is null && facts.TopicId is { } discoveredTopic)
+        {
+            ctx.Query.TopicId = discoveredTopic;
+            _locator.PrimeTopic(discoveredTopic);
+            ctx.Log?.Invoke($"  · 从「{facts.AuthorName}」这一棒发现话题 topic_id={discoveredTopic}，后续定位改用话题索引");
+        }
 
         ctx.Visited[key] = node;
         // 同一帖在不同来源里可能给的是 opus id 或链接里的 id，两把钥匙都登记，避免重复成节点

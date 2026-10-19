@@ -509,6 +509,9 @@ public static class ChainSelfTest
             // 每次返回新列表：调用方会按时间距离排序，别把假数据的顺序改乱。
             return list.ToList();
         }
+
+        /// <summary>自检里没有真实话题接口，忽略即可（假 locator 直接按用户表返回）。</summary>
+        public void PrimeTopic(long? topicId) { }
     }
 
     // ================================================================ 测试脚手架

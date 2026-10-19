@@ -299,7 +299,7 @@ public sealed class SpaceFinder
     }
 
     /// <summary>取正文第一行非空内容当标题（content 是整段正文，首行≈标题）。</summary>
-    private static string FirstLine(string content)
+    internal static string FirstLine(string content)
     {
         if (string.IsNullOrEmpty(content)) return "";
         foreach (var raw in content.Split('\n'))

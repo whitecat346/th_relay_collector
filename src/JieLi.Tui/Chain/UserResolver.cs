@@ -63,6 +63,12 @@ public sealed class ChainUserLocator : IUserLocator
     /// <summary>已经作为兜底候选交出去过的帖子 id，避免同一条被反复塞进不同邻居的候选池。</summary>
     private readonly HashSet<string> _offeredRefs = new(StringComparer.Ordinal);
 
+    /// <summary>已建立的话题索引（null 时还没建；空索引表示建过但失败/为空）。</summary>
+    private TopicIndex? _topicIndex;
+
+    /// <summary>话题索引对应的 topic_id，用于判断是否需要重建。</summary>
+    private long? _topicIndexId;
+
     public ChainUserLocator(ChainHttp http, ChainSearchClient search, UserCache cache)
     {
         Http = http;
@@ -74,6 +80,30 @@ public sealed class ChainUserLocator : IUserLocator
     public ChainHttp Http { get; }
     public ChainSearchClient Search { get; }
     public UserCache Cache { get; }
+
+    /// <inheritdoc />
+    public void PrimeTopic(long? topicId)
+    {
+        if (topicId is null or <= 0) return;
+        if (_topicIndexId == topicId) return;
+        // 换话题就作废旧索引，下次用到时重建（懒加载，避免入口没话题时白拉一次）
+        if (_topicIndexId is not null) _topicIndex = null;
+        _topicIndexId = topicId;
+    }
+
+    /// <summary>
+    /// 确保话题索引就绪（懒加载）。索引建立失败只记日志，调用方自然退回搜索路径。
+    /// 为什么把它放在阶梯最前面：搜索接口会被风控（v_voucher），而话题卡片接口不会；
+    /// 且话题卡片是「这场接力自己的成员表」，比昵称搜索更权威（不会命中同名路人）。
+    /// </summary>
+    private TopicIndex? EnsureTopicIndex(Action<string>? log, CancellationToken ct)
+    {
+        if (_topicIndexId is null or <= 0) return null;
+        if (_topicIndex is not null) return _topicIndex;
+        log?.Invoke($"[话题索引] 建立 topic_id={_topicIndexId} 的名字→uid→帖子索引（不用搜索接口）");
+        _topicIndex = TopicIndex.Load(Http, _topicIndexId.Value, log, ct);
+        return _topicIndex;
+    }
 
     /// <inheritdoc />
     public UserRef? Resolve(string name, string? hintUid, Action<string>? log, CancellationToken ct)
@@ -98,6 +128,49 @@ public sealed class ChainUserLocator : IUserLocator
         {
             log?.Invoke("[用户] 没有可用 hintUid 且昵称为空，无法定位");
             return null;
+        }
+
+        // ---------------- ① 话题作者表：优先用「这场接力自己的成员表」 ----------------
+        // 顺序刻意放在搜索前面：① 话题卡片接口不受搜索风控影响（v_voucher）；
+        // ② 它只包含本次活动成员，不会像 bili_user 搜索那样命中同名路人。
+        try
+        {
+            var topic = EnsureTopicIndex(log, ct);
+            var hit = topic?.ResolveByName(wanted, log);
+            if (hit is not null)
+            {
+                log?.Invoke($"[①话题作者表] FetchMethod.TopicAuthorTable 命中 uid={hit.Uid}「{hit.Name}」（Exact={hit.Exact}），不发搜索请求");
+                RememberResolved(hit.Uid, hit.Name, FetchMethod.TopicAuthorTable, hit.Exact, log);
+                return hit;
+            }
+            if (topic is { IsBuilt: true })
+                log?.Invoke($"[①话题作者表] 话题 {topic.Cards.Count} 张卡片里没有「{wanted}」，降级到用户搜索");
+
+            // 代发棒：作者是代发账号，正文里写着「@这个名字」（实测 17:00 那棒就是
+            // 龙胆紫苑 代发 @茶猫祈祷中，按作者名永远找不到）。
+            var mentioned = topic?.FindByMention(wanted) ?? Array.Empty<TopicCardEntry>();
+            var uniqueAuthors = mentioned.Select(m => m.AuthorUid).Distinct().ToList();
+            if (uniqueAuthors.Count == 1)
+            {
+                var proxy = mentioned[0];
+                log?.Invoke($"[①话题作者表]「{wanted}」不是话题作者，但被 {proxy.AuthorName}(uid={proxy.AuthorUid}) 的卡片正文点名"
+                    + $"（代发/代理），按代发账号继续找");
+                RememberResolved(proxy.AuthorUid, wanted, FetchMethod.TopicAuthorTable, exact: false, log);
+                return new UserRef
+                {
+                    Uid = proxy.AuthorUid,
+                    Name = wanted,
+                    Method = FetchMethod.TopicAuthorTable,
+                    Exact = false,
+                };
+            }
+            if (uniqueAuthors.Count > 1)
+                log?.Invoke($"[①话题作者表]「{wanted}」被 {uniqueAuthors.Count} 个不同账号的卡片点名，无法判断谁是代发者，降级到用户搜索");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            log?.Invoke($"[①话题作者表] 失败：{ex.Message}（降级到用户搜索）");
         }
 
         // ---------------- ② bili_user 搜索，昵称精确命中 ----------------
@@ -166,6 +239,89 @@ public sealed class ChainUserLocator : IUserLocator
         }
 
         var relay = string.IsNullOrWhiteSpace(query.RelayName) ? null : query.RelayName!.Trim();
+
+        // ---------------- ⓪ 话题卡片：有索引就直接给候选 ----------------
+        // 这是「搜索被风控」现实下的第一条腿：话题卡片里本来就带着每一棒的帖 id、
+        // 作者 uid、发布时间，还有视频卡的 bvid（第 5 棒那种只在话题里出现的视频也能拿到）。
+        try
+        {
+            var topic = EnsureTopicIndex(log, ct);
+            if (topic is { IsBuilt: true })
+            {
+                var cards = topic.ByUid(user.Uid);
+                if (cards.Count > 0)
+                {
+                    var candidates = new List<PostCandidate>();
+                    foreach (var card in cards)
+                    {
+                        var candidate = new PostCandidate
+                        {
+                            Ref = card.Kind == PostKind.Video ? PostRef.Video(card.Id) : PostRef.Opus(card.Id),
+                            Title = !string.IsNullOrWhiteSpace(card.Text) ? SpaceFinder.FirstLine(card.Text) : card.Title,
+                            PubTs = card.PubTs,
+                            Method = FetchMethod.TopicCards,
+                            AuthorUid = card.AuthorUid,
+                            Why = $"话题卡片（topic={topic.TopicId}，作者 {card.AuthorName}）",
+                        };
+                        candidates.Add(candidate);
+                    }
+                    var kept = candidates.Where(c => SpaceFinder.InWindow(c.PubTs, query)).ToList();
+                    log?.Invoke($"[⓪话题卡片] uid={user.Uid}「{user.Name}」在话题里有 {cards.Count} 条，时间窗内 {kept.Count} 条");
+                    if (kept.Count > 0)
+                    {
+                        foreach (var c in kept) _offeredRefs.Add(c.Ref.Id);
+                        Cache.Remember(user.Uid, user.Name, relay, true, FetchMethod.TopicCards,
+                            kept.Select(c => c.Ref.Id),
+                            $"话题 {topic.TopicId} 卡片直接命中 {kept.Count} 条");
+                        Cache.FlushIfDirty(log);
+                        return kept;
+                    }
+                }
+                else
+                {
+                    log?.Invoke($"[⓪话题卡片] uid={user.Uid}「{user.Name}」不在话题成员里，继续走空间/搜索");
+                }
+
+                // 代发/代理：作者名对不上、但某张卡片正文点名了这个人（实测 17:00 那棒
+                // 「龙胆紫苑 代发 @茶猫祈祷中」，卡片正文只有 17:00 @茶猫祈祷中）。
+                if (!string.IsNullOrWhiteSpace(user.Name) && user.Name.Trim() != "?")
+                {
+                    var mentioned = topic.FindByMention(user.Name);
+                    if (mentioned.Count > 0)
+                    {
+                        var keptMentions = new List<PostCandidate>();
+                        foreach (var card in mentioned)
+                        {
+                            keptMentions.Add(new PostCandidate
+                            {
+                                Ref = card.Kind == PostKind.Video ? PostRef.Video(card.Id) : PostRef.Opus(card.Id),
+                                Title = !string.IsNullOrWhiteSpace(card.Text) ? SpaceFinder.FirstLine(card.Text) : card.Title,
+                                PubTs = card.PubTs,
+                                Method = FetchMethod.TopicCards,
+                                AuthorUid = card.AuthorUid,
+                                Why = $"话题卡片正文点名「{user.Name}」（发布者 {card.AuthorName}，可能是代发）",
+                            });
+                        }
+                        var keptByWindow = keptMentions.Where(c => SpaceFinder.InWindow(c.PubTs, query)).ToList();
+                        log?.Invoke($"[⓪话题卡片]「{user.Name}」被 {mentioned.Count} 张卡片正文点名，时间窗内 {keptByWindow.Count} 条");
+                        if (keptByWindow.Count > 0)
+                        {
+                            foreach (var c in keptByWindow) _offeredRefs.Add(c.Ref.Id);
+                            Cache.Remember(user.Uid, user.Name, relay, true, FetchMethod.TopicCards,
+                                keptByWindow.Select(c => c.Ref.Id),
+                                $"话题 {topic.TopicId} 正文点名命中 {keptByWindow.Count} 条（可能是代发）");
+                            Cache.FlushIfDirty(log);
+                            return keptByWindow;
+                        }
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            log?.Invoke($"[⓪话题卡片] 失败：{ex.Message}（继续走空间/搜索）");
+        }
 
         // ---------------- 缓存：同一 (uid, relay) 7 天内不重跑网络 ----------------
         var cached = Cache.Find(user.Uid, relay);

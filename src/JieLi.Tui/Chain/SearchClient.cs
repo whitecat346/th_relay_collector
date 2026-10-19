@@ -48,13 +48,35 @@ public sealed class ChainSearchClient
 
     private readonly ChainHttp _http;
 
+    /// <summary>
+    /// 本轮是否已经吃过风控挑战（v_voucher）。一旦触发，后续所有搜索直接跳过：
+    /// 实测挑战短时间内不会解除，继续打只会每次白等 30 秒冷却，让一次遍历从 3 分钟拖到 10 分钟以上。
+    /// 搜索是「锦上添花」的手段（话题卡片才是主干），跳过它不是致命问题。
+    /// </summary>
+    private bool _challenged;
+
+    /// <summary>是否已经为「风控挑战」付过一次 30 秒冷却（只付一次）。</summary>
+    private bool _challengeCooledDown;
+
     public ChainSearchClient(ChainHttp http) => _http = http;
+
+    /// <summary>本轮是否已触发风控挑战（报告/日志用）。</summary>
+    public bool ChallengeHit => _challenged;
+
+    /// <summary>已触发挑战时记一条说明并返回 true（调用方据此直接返回空结果）。</summary>
+    private bool ShortCircuit(string what, Action<string>? log)
+    {
+        if (!_challenged) return false;
+        log?.Invoke($"[搜索] 本轮已触发风控挑战，跳过{what}（改用话题卡片/空间动态等不受影响的路径）");
+        return true;
+    }
 
     /// <summary>用户搜索（bili_user）。返回可能为空的候选列表（Exact 由 Resolve 判）。</summary>
     public IReadOnlyList<UserRef> SearchUsers(string keyword, Action<string>? log, CancellationToken ct)
     {
         var list = new List<UserRef>();
         if (string.IsNullOrWhiteSpace(keyword)) return list;
+        if (ShortCircuit("用户搜索", log)) return list;
 
         var url = $"{SearchTypeApi}?search_type=bili_user&keyword={Uri.EscapeDataString(keyword.Trim())}&page=1";
         string json;
@@ -64,6 +86,7 @@ public sealed class ChainSearchClient
         }
         catch (ChainFetchException ex)
         {
+            if (ex.Message.Contains("v_voucher", StringComparison.Ordinal)) _challenged = true;
             log?.Invoke($"[搜索] bili_user「{keyword}」请求失败：{ex.Message}");
             return list;
         }
@@ -91,6 +114,7 @@ public sealed class ChainSearchClient
     {
         var list = new List<PostCandidate>();
         if (string.IsNullOrWhiteSpace(keyword)) return list;
+        if (ShortCircuit("文章搜索", log)) return list;
 
         // 文章搜索是弱手段，只取搜索排序第一页（20 条）即可；翻页交给人工/后续版本。
         var url = $"{SearchTypeApi}?search_type=article&keyword={Uri.EscapeDataString(keyword.Trim())}&page=1";
@@ -101,6 +125,7 @@ public sealed class ChainSearchClient
         }
         catch (ChainFetchException ex)
         {
+            if (ex.Message.Contains("v_voucher", StringComparison.Ordinal)) _challenged = true;
             log?.Invoke($"[搜索] article「{keyword}」请求失败：{ex.Message}");
             return list;
         }
@@ -144,6 +169,7 @@ public sealed class ChainSearchClient
     {
         var list = new List<PostCandidate>();
         if (string.IsNullOrWhiteSpace(keyword)) return list;
+        if (ShortCircuit("视频搜索", log)) return list;
 
         var pages = Math.Clamp(maxPages, 1, MaxVideoPages);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -168,10 +194,13 @@ public sealed class ChainSearchClient
                 }
                 catch (ChainFetchException ex)
                 {
+                    if (ex.Message.Contains("v_voucher", StringComparison.Ordinal)) _challenged = true;
                     log?.Invoke($"[搜索] video「{keyword}」第 {page} 页失败：{ex.Message}");
                     // 风控挑战给一次长冷却重试的机会（实测挑战会在几十秒后自行解除）。
-                    if (ex.Message.Contains("v_voucher", StringComparison.Ordinal) && attempt == 0)
+                    // 只在「本轮第一次」挑战时冷却重试，避免反复白等把一次遍历拖成十分钟。
+                    if (ex.Message.Contains("v_voucher", StringComparison.Ordinal) && attempt == 0 && !_challengeCooledDown)
                     {
+                        _challengeCooledDown = true;
                         log?.Invoke("[搜索] 触发风控挑战，冷却 30 秒后重试一次");
                         Thread.Sleep(30000);
                         continue;
