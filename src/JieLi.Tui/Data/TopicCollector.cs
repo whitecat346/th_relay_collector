@@ -185,6 +185,8 @@ public sealed class TopicCollector
         await using var w = new StreamWriter(path, false, new UTF8Encoding(false));
         foreach (var b in result.Bars)
         {
+            // 重复投稿 / 非棒次插曲：不进入人工确认清单，避免把 CSV 撑出多余的行
+            if (b.IsDuplicate) continue;
             await w.WriteLineAsync(JsonSerializer.Serialize(new
             {
                 card_id = b.CardId,
@@ -219,8 +221,29 @@ public sealed class TopicCollector
         }
     }
 
-    private static string GetString(JsonElement e, string name)
-        => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? string.Empty : string.Empty;
+    /// <summary>
+    /// 写出被排除的卡片（同一棒位的重复投稿 / 非棒次插曲）。
+    /// 它们不进入 review.jsonl（否则会变成 CSV 里的 N/A 行），但必须可审计：
+    /// 报告里要能回答「为什么这条没进归档」。
+    /// </summary>
+    public static async Task WriteIgnoredAsync(string workRoot, long topicId, ValidationResult result, CancellationToken ct = default)
+    {
+        if (result.Ignored.Count == 0) return;
+        var dir = Path.Combine(workRoot, topicId.ToString());
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "ignored.jsonl");
+        await using var w = new StreamWriter(path, false, new UTF8Encoding(false));
+        foreach (var i in result.Ignored)
+            await w.WriteLineAsync(JsonSerializer.Serialize(new
+            {
+                card_id = i.CardId,
+                author = i.Author,
+                time = i.Time,
+                reason = i.Reason,
+            }, JsonlOut));
+    }
+
+    private static string GetString(JsonElement e, string name)        => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? string.Empty : string.Empty;
 
     private static long GetLong(JsonElement e, string name)
         => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt64() : 0L;

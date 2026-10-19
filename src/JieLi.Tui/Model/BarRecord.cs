@@ -135,6 +135,12 @@ public sealed class ParsedBar
     /// <summary>该卡片是否为活动的总结/名册动态（不是一根棒）。</summary>
     public bool IsSummary { get; set; }
 
+    /// <summary>
+    /// 同一棒位的重复投稿 / 同一作者的非棒次第二帖（插曲、约稿、bgm 说明…）。
+    /// 这类条目**不产出归档行**，只在报告里列出来让人核对，避免污染 CSV。
+    /// </summary>
+    public bool IsDuplicate { get; set; }
+
     /// <summary>声明的创作者没有被正确 @ 出来（B站不渲染成 &lt;a&gt;），需人工处理。</summary>
     public string? UnlinkedCreator { get; set; }
     /// <summary>出现了"上一棒/下一棒"字样但没有可识别的 @ 提及（对方未正确 @ 出），需人工处理。</summary>

@@ -14,12 +14,24 @@ public sealed class ValidationResult
     public string? RosterCardId { get; set; }
     public List<RosterSlot> RosterSlots { get; set; } = new();
 
-    public int Attributed => Bars.Count(b => b.BarNumber.HasValue || b.IsEx);
-    public int Unattributable => Bars.Count(b => b.IsUnattributable);
-    public int ConflictCount => Bars.Count(b => b.Conflicts.Count > 0);
+    public int Attributed => Bars.Count(b => !b.IsDuplicate && (b.BarNumber.HasValue || b.IsEx));
+    public int Unattributable => Bars.Count(b => !b.IsDuplicate && b.IsUnattributable);
+    public int ConflictCount => Bars.Count(b => !b.IsDuplicate && b.Conflicts.Count > 0);
     public int ProxyCount => Bars.Count(b => b.IsProxy);
     public int MaxBar => Bars.Where(b => b.BarNumber.HasValue).Select(b => b.BarNumber!.Value).DefaultIfEmpty(0).Max();
+
+    /// <summary>
+    /// 被排除的卡片：同一棒位的重复投稿、同一作者的非棒次第二帖。
+    /// 它们不进入归档产出（CSV/md），但必须在报告里列出来，让"少了什么"是可审计的。
+    /// </summary>
+    public List<IgnoredCard> Ignored { get; } = new();
+
+    /// <summary>时段网格的说明（没有走时段制时为空）。</summary>
+    public string? SlotGridNote { get; set; }
 }
+
+/// <summary>一条被排除的卡片。</summary>
+public sealed record IgnoredCard(string CardId, string Author, string Time, string Reason);
 
 /// <summary>
 /// M3 交叉校验器。三路"证据"的含义（设计阶段确定的口径）：
@@ -123,7 +135,7 @@ public static class ArtifactValidator
         AssignBarNumbersFromRoster(bars, rosterSlots);
 
         // 仍无棒号时：退回"时段反演"（只对有时段的卡片有效）
-        AssignBarNumbersByTime(bars, rosterSlots);
+        AssignBarNumbersByTime(bars, rosterSlots, result, tag);
 
         // ---------- 第二遍：数据驱动的"发布者是否创作者" ----------
         ApplyProxyHeuristic(bars);
@@ -178,7 +190,7 @@ public static class ArtifactValidator
         // ---------- 逐条标注问题 ----------
         foreach (var b in bars)
         {
-            if (b.IsSummary) continue; // 总结/名册卡不参与逐条问题标注
+            if (b.IsSummary || b.IsDuplicate) continue; // 总结/名册卡与已排除的重复卡不参与逐条问题标注
 
             // 上下棒定位：出现了"上一棒/下一棒"字样，却没有可识别的 @ 提及
             // （用户要求：对方没有被正确 @ 出来 → 归为异常，交人工处理）
@@ -210,23 +222,29 @@ public static class ArtifactValidator
                 b.Notes.Add("未标注下一棒");
         }
 
+        // ---------- 被排除的卡片：必须在报告里可审计 ----------
+        if (result.Ignored.Count > 0)
+            result.Warnings.Add($"排除了 {result.Ignored.Count} 条非棒次卡片（重复投稿/插曲/约稿），它们不进入归档；"
+                                + "逐条原因见报告的「已排除卡片」一节");
+
         return result;
     }
 
     /// <summary>
-    /// 无"第N棒"格式时，用**时段**反演棒号：
-    ///   ① 优先靠名册（总结动态）——名册顺序就是棒序，见 topic 1348289；
-    ///   ② 无名册则按唯一时段排序赋号，并标注低置信度。
+    /// 无「第N棒」格式时的棒号反演，三级：
+    ///   ① 名册（总结动态）——名册顺序就是棒序，见 topic 1348289；
+    ///   ② 「时段 = 棒位」网格——正文只写时段的接力（见 topic 1349127），由 <see cref="SlotGrid"/> 推断；
+    ///   ③ 都推不出来就留 N/A，交给人工，绝不错位编号。
     /// 只在"本卡没有棒号"时生效，绝不覆盖正文里已写明的棒号。
     /// </summary>
-    private static void AssignBarNumbersByTime(List<ParsedBar> bars, List<RosterSlot> roster)
+    private static void AssignBarNumbersByTime(
+        List<ParsedBar> bars, List<RosterSlot> roster, ValidationResult result, string? tag)
     {
         // 只对"带本活动话题标签 + 有时段"的卡片做时段反演，否则会把无关投稿也编号
-        var candidates = bars.Where(b => b.BarNumber is null && !b.IsEx
+        var candidates = bars.Where(b => b.BarNumber is null && !b.IsEx && !b.IsSummary
                                          && b.DeclaredTime is { Length: > 0 }
                                          && (b.HasTopicTag || b.CreatorInText is { Length: > 0 }))
                              .ToList();
-        if (candidates.Count == 0) return;
 
         if (roster.Count > 0)
         {
@@ -250,12 +268,33 @@ public static class ArtifactValidator
                     b.Conflicts.Add($"时段 {b.DeclaredTime} 不在总结名册里，无法确定棒号");
                 }
             }
+            if (candidates.Count > 0) return;
+
+            // 名册在手但没有任何卡片带时段：仍可整体按名册顺序对齐（见 AssignBarNumbersFromRoster）
             return;
         }
 
-        // 无名册：不自动赋号（避免把无关投稿编号），只提示需要人工确认
-        foreach (var b in candidates)
-            b.Conflicts.Add($"未找到总结名册，且正文只有时段 {b.DeclaredTime} 没有棒号 —— 需人工确认棒号");
+        // ---- ② 没有名册：试「时段 = 棒位」网格（时段制接力的通用解法） ----
+        var plan = SlotGrid.Infer(bars, tag);
+        result.SlotGridNote = plan.Describe();
+        result.Warnings.Add(plan.Describe());
+        foreach (var w in plan.Warnings) result.Warnings.Add("时段网格：" + w);
+
+        if (!plan.Ok)
+        {
+            foreach (var b in bars.Where(b => b.BarNumber is null && !b.IsEx && !b.IsSummary && !b.IsDuplicate))
+                b.Conflicts.Add("既没有总结名册，也没能建立可靠的时段网格 —— 棒号需人工确认");
+            return;
+        }
+
+        SlotGrid.Assign(bars, plan, result);
+
+        // 网格赋值后仍有未归属的：把原因写清楚（多半是插曲/约稿/预热）
+        foreach (var b in bars.Where(b => b.BarNumber is null && !b.IsEx && !b.IsSummary && !b.IsDuplicate
+                                          && b.Conflicts.Count == 0))
+        {
+            b.Conflicts.Add("未落在时段网格的槽位上 —— 可能是插曲/约稿/预告，需人工确认是否算一棒");
+        }
     }
 
     /// <summary>

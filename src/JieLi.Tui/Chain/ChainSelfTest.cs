@@ -62,6 +62,7 @@ public static class ChainSelfTest
         state.Case("O 鸣谢行不是作者归属：13:00 @蔼石 + 鸣谢约稿插图作者：@SAM271", CaseAcknowledgementNotCreator);
         state.Case("P AM/PM 换算：10:08 PM @交联纤维素 → 22:08", CaseMeridiemTime);
         state.Case("Q 年份闸门：同话题往年（差 365 天）的帖子即使结构+声明时段齐全也拒收", CaseOffYearRejected);
+        state.Case("R 时段网格：整点/半小时成格、重复投稿只占一格、前一天的预告贴不进格", CaseSlotGrid);
 
         state.Line($"  遍历器与落盘用例：通过 {state.Passed}，失败 {state.Failed}");
         return new ChainSelfTestResult { Passed = state.Passed, Failed = state.Failed };
@@ -553,6 +554,59 @@ public static class ChainSelfTest
         s.Check("提前一天发布占位 → 仍然收", outcomeEarly.Accepted,
             $"Accepted={outcomeEarly.Accepted}：{outcomeEarly.Reason}");
     }
+
+    // ================================================================ 用例 R
+
+    /// <summary>
+    /// 时段网格（无名册的活动：正文只写「17:00 @某人」，不写「第N棒」）。
+    /// 实测语料 topic 1349127 的形态：整点+半小时成格、同一棒位有重复投稿、
+    /// 还有一条**前一天**发的预告贴自称 15:30（当年差点把整个棒号推后一格）。
+    /// </summary>
+    private static void CaseSlotGrid(RunState s)
+    {
+        var day = new DateTime(2026, 10, 8);
+        var bars = new List<ParsedBar>
+        {
+            Bar("a", "作者A", day.AddHours(0)),
+            Bar("b", "作者B", day.AddHours(1)),
+            Bar("c", "作者C", day.AddHours(1)),                 // 同一棒位重复投稿
+            Bar("d", "作者D", day.AddHours(2), declared: "2:00"),
+            Bar("e", "作者E", day.AddHours(1).AddMinutes(37), declared: "1:30"), // 迟到但声明了时段
+            Bar("f", "作者F", day.AddDays(-1).AddHours(15), declared: "15:30"),  // 前一天的预告贴
+        };
+
+        var plan = SlotGrid.Infer(bars, null);
+        s.Check("网格建成", plan.Ok, string.Join("；", plan.Warnings));
+        s.Check("活动日=2026-10-08", plan.DayText.Contains("10-08", StringComparison.Ordinal), plan.DayText);
+        s.Check("槽位数=4（00:00/01:00/01:30/02:00）", plan.Slots.Count == 4,
+            $"实际 {plan.Slots.Count}：{string.Join(",", plan.Slots.Select(x => x.Time))}");
+        s.Check("前一天 15:30 的预告贴不在网格上", SlotGrid.SlotOf(bars[5], plan) is null,
+            SlotGrid.SlotOf(bars[5], plan)?.Time ?? "null");
+        s.Check("声明时段优先于发布时刻（1:37 → 1:30 槽）",
+            SlotGrid.SlotOf(bars[4], plan)?.Minutes == 90,
+            SlotGrid.SlotOf(bars[4], plan) is { } slotE ? $"{slotE.Time}（{slotE.Minutes} 分）" : "null");
+
+        var result = new ValidationResult();
+        SlotGrid.Assign(bars, plan, result);
+        s.Check("第 i 格 = 第 i 棒：00:00→1、01:00→2、01:30→3、02:00→4",
+            bars[0].BarNumber == 1 && bars[1].BarNumber == 2 && bars[4].BarNumber == 3 && bars[3].BarNumber == 4,
+            string.Join(",", bars.Select(b => $"{b.CardId}:{b.BarNumber?.ToString() ?? "null"}")));
+        s.Check("同棒位重复投稿：只留一条，另一条标记 IsDuplicate 并进 ignored 清单",
+            result.Ignored.Count == 1 && bars.Count(b => b.IsDuplicate) == 1,
+            $"Ignored={result.Ignored.Count}，IsDuplicate={bars.Count(b => b.IsDuplicate)}");
+        s.Check("不在活动日的预告贴不赋棒号", bars[5].BarNumber is null,
+            bars[5].BarNumber?.ToString() ?? "null");
+    }
+
+    /// <summary>造一条 ParsedBar：CardId、发布者、本地发布时刻（可选声明时段）。</summary>
+    private static ParsedBar Bar(string id, string poster, DateTime local, string? declared = null) => new()
+    {
+        CardId = id,
+        PosterName = poster,
+        ResolvedAuthor = poster,
+        PubTs = new DateTimeOffset(DateTime.SpecifyKind(local, DateTimeKind.Local)).ToUnixTimeSeconds(),
+        DeclaredTime = declared,
+    };
 
     // ================================================================ 假实现
 

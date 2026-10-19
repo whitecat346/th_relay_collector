@@ -668,6 +668,7 @@ public static class Program
         Log($"  话题标签 {SummaryExtractor.InferTopicTag(cards, manifest.Name) ?? "（未识别）"}");
         Log($"  总结名册 {(result.RosterCardId is null ? "未找到" : $"opus/{result.RosterCardId}（{result.RosterSlots.Count} 个棒位）")}");
         Log($"  有棒号/EX {result.Attributed}   无法归属 {result.Unattributable}   含冲突 {result.ConflictCount}");
+        if (result.SlotGridNote is { Length: > 0 } gridNote) Log("  " + gridNote);
         foreach (var f in result.AssertionFailures) Log("  ✗ " + f);
 
         // 3) 写 review.jsonl
@@ -677,6 +678,16 @@ public static class Program
                        .GetAwaiter().GetResult();
         var rp = Path.Combine(workRoot, topicId.Value.ToString(), "review.jsonl");
         Log($"  {rp}  ({new FileInfo(rp).Length:N0} 字节)");
+        TopicCollector.WriteIgnoredAsync(workRoot, topicId.Value, result, CancellationToken.None)
+                       .GetAwaiter().GetResult();
+        if (result.Ignored.Count > 0)
+        {
+            Log($"  {Path.Combine(workRoot, topicId.Value.ToString(), "ignored.jsonl")}  "
+                + $"（{result.Ignored.Count} 条被排除的卡片：重复投稿/插曲/约稿）");
+            foreach (var ig in result.Ignored.Take(8))
+                Log($"    · {ig.Time} @{ig.Author}：{ig.Reason}");
+            if (result.Ignored.Count > 8) Log($"    · … 另有 {result.Ignored.Count - 8} 条，见文件");
+        }
         Log("");
         Log("下一步：运行 jieli 进入 TUI → 选择本话题进行人工确认（待确认项修完才能产出最终归档）。");
         return 0;
@@ -945,8 +956,17 @@ public static class Program
         }
         if (start.Kind == Chain.PostKind.Topic)
         {
-            Log("话题入口的链遍历接线安排在下一轮。现在请改用「某一棒」的帖子链接（opus / 动态 / 视频）。");
-            return 2;
+            // 话题入口：话题里**已经**装着这场接力的全部帖子，不需要靠 @ 一棒棒摸过去。
+            // 直接走成熟的话题流程（采集 → 解析/交叉校验 → review.jsonl），
+            // 后面的 --review / --render 与话题模式完全一致。
+            Log($"入口是「话题」（topic_id={start.Id}）—— 话题本身就是整场接力的全集，不需要链遍历。");
+            Log("改走话题流程：采集 → 解析与交叉校验 → 写 review.jsonl。");
+            if (addLinks.Count > 0)
+                Log("提示：话题入口不需要 --add-link（话题卡片已经覆盖全部帖子），这些补充链接被忽略。");
+            if (dateArg is not null || hoursArg > 0)
+                Log("提示：话题入口不需要 --date/--hours（活动日由卡片发布时间推断），这些参数被忽略。");
+            Log("");
+            return RunPipeline(root, start.Id.ToString(), outDir);
         }
 
         var supplements = new List<(Chain.PostRef Ref, int? ForcedBar)>();
@@ -1276,6 +1296,8 @@ public static class Program
         Console.WriteLine();
         Console.WriteLine("接力链遍历（给一棒，双向把整条链补全；接力靠 @ 下一个人，不是贴链接）:");
         Console.WriteLine("  jieli --link <帖子链接>                入口：opus / t.bilibili.com / video BV·av");
+        Console.WriteLine("  jieli --link <话题链接>                入口也可以是话题：接力本来就建了话题时，直接走话题流程");
+        Console.WriteLine("                                         （话题里没有「第N棒」时按「时段 = 棒位」推算棒号）");
         Console.WriteLine("  jieli --add-link <帖子链接> [--at-bar N]  人工补录一棒（可多次；--at-bar 强制棒号）");
         Console.WriteLine("  --date <2026-09-06|9-6>                活动日期；只给月日时年份取入口帖的年份");
         Console.WriteLine("  --hours <N>                            活动声明时长（24h/32h…），用于放宽搜索区间");

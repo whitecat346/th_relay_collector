@@ -85,6 +85,11 @@ public static class ArchiveRenderer
         if (unconfirmed.Count > 0)
             warnings.Add($"有 {unconfirmed.Count} 条未确认，按 --allow-unconfirmed 强制产出（产物可能不完整）");
 
+        // ---- 宣传信息齐全性（meta.yml 是唯一真值源，机器绝不猜） ----
+        var promoEmpty = string.IsNullOrWhiteSpace(meta.MainHostName) && meta.Promotions.Count == 0;
+        if (promoEmpty)
+            warnings.Add("meta.yml 里的「主催」「宣传」还是空的：宣传段会留空。请先填写 meta.yml，再重新运行 --render。");
+
         // ---------- 组装行 ----------
         var active = items.Where(i => !i.Ignored && !i.IsSummary).ToList();
         var (rows, unnumbered) = BuildRows(active, meta, warnings);
@@ -190,10 +195,9 @@ public static class ArchiveRenderer
         var all = new List<ArchiveRow>();
         all.AddRange(numbered);
         all.AddRange(exRows);
-        // 棒数异常的行**附加在文件末尾**（而不是紧跟整点棒之后）：
-        // 既有归档的 CSV 通篇都是数字棒号，且 legacy/csv_md.py 会对棒号做 float()，
-        // 遇到 N/A 会直接抛错。把异常行放最后，既保持既有解析习惯，也让"棒数异常"一眼可见。
-        all.AddRange(unnumbered);
+        // 棒数异常的行由调用方单独追加（BuildCsv/BuildMarkdown 的第二个参数）。
+        // 这里绝对不能再把它们塞进 rows —— 否则 CSV 会写两遍、md 里会同时出现
+        // 「### 第N/A棒」和「## 棒数异常」两处（实测踩过）。
         if (unnumbered.Count > 0)
             warnings.Add($"有 {unnumbered.Count} 条棒数异常（无法确定棒号），已按时间排序附加在 CSV/MD 末尾，棒号列写 N/A");
         return (all, unnumbered);

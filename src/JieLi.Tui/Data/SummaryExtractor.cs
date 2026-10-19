@@ -222,6 +222,17 @@ public static class SummaryExtractor
         RegexOptions.Compiled);
 
     /// <summary>
+    /// 行首「HH:MM @名字」——**没有竖线分隔**的写法。
+    /// 实测 topic 1349127 第 23 棒：「17:00 @茶猫祈祷中」（作者龙胆紫苑代发）。
+    /// 上面几个正则都要求时间与 @ 之间有 | ｜ 丨，这类帖子会整条拿不到时段，
+    /// 于是被当成"不在整点槽位上"的插曲排除掉——棒号会整体错位一格。
+    /// </summary>
+    private static readonly Regex LineStartTimeAtNameRegex = new(
+        @"(?m)^[ \t　]*(?:第)?(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?:棒)?[ \t　]*"
+        + @"(?<q>[^\s@＠0-9\n|｜丨]{0,6})?[ \t　]*[@＠]\s*(?<who>[^\s@<（(、,，|｜\n]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>
     /// 无"第N棒"格式时的补充解析：从正文/标题里取「时段 + 创作者」。
     /// 返回 true 表示找到时段；creator 可能为空（需再用邻居指认补）。
     /// </summary>
@@ -283,6 +294,18 @@ public static class SummaryExtractor
             {
                 time = TextNormalizer.NormalizeTime(m.Groups["h"].Value, m.Groups["m"].Value);
                 creator ??= TextNormalizer.CleanMention(m.Groups["who"].Value);
+            }
+        }
+
+        // 3c) 行首「HH:MM @名字」（没有竖线分隔）——实测 topic 1349127 的「17:00 @茶猫祈祷中」
+        if (time is null)
+        {
+            var head = LineStartTimeAtNameRegex.Match(text);
+            if (head.Success && head.Groups["h"].Value.Length <= 2)
+            {
+                time = TextNormalizer.NormalizeTime(head.Groups["h"].Value, head.Groups["m"].Value);
+                if (qualifier is null && head.Groups["q"].Success) qualifier = head.Groups["q"].Value.Trim();
+                creator ??= TextNormalizer.CleanMention(head.Groups["who"].Value);
             }
         }
 
