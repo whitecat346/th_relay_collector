@@ -1,7 +1,7 @@
-# relay-tool · 东方Project接力归档工具
+# th_relay_collector · 东方Project接力归档工具
 
 半自动的接力归档流水线：**采集 → 解析交叉校验 → 人工确认 → 渲染归档**。
-.NET 10 / Windows x64 / 零第三方依赖（NuGet 缓存里没有 Spectre.Console，TUI 用原生 ANSI 自绘）。
+.NET 10 / Windows x64 / 零第三方依赖
 
 > 📖 **第一次用请先读 [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md)** —— 从首次自动收集、TUI 纠错到保存归档的完整手册。
 > 想知道"为什么这么设计 / 哪些做法已经试过并失败"请看 [`docs/CORPUS-FINDINGS.md`](docs/CORPUS-FINDINGS.md)。
@@ -144,7 +144,7 @@ jieli                                     # 只读审阅已有归档（22 个目
 用 VS 打开**工作目录根**的解决方案文件：
 
 ```
-D:\东方接力收集\JieLi.slnx
+JieLi.slnx
 ```
 
 （VS 2022 17.14+ / 需装 .NET 10 SDK；低版本装不了就直接用命令行。）
