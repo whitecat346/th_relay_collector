@@ -61,6 +61,7 @@ public static class ChainSelfTest
         state.Case("N 创作者归属：19:00 作者:@羽衣的皇带鱼 → 创羽衣的皇带鱼/代发", CaseAuthorLabelCreator);
         state.Case("O 鸣谢行不是作者归属：13:00 @蔼石 + 鸣谢约稿插图作者：@SAM271", CaseAcknowledgementNotCreator);
         state.Case("P AM/PM 换算：10:08 PM @交联纤维素 → 22:08", CaseMeridiemTime);
+        state.Case("Q 年份闸门：同话题往年（差 365 天）的帖子即使结构+声明时段齐全也拒收", CaseOffYearRejected);
 
         state.Line($"  遍历器与落盘用例：通过 {state.Passed}，失败 {state.Failed}");
         return new ChainSelfTestResult { Passed = state.Passed, Failed = state.Failed };
@@ -518,6 +519,39 @@ public static class ChainSelfTest
         var facts = Extracted("交联纤维素", "10:08 PM @交联纤维素", "交联纤维素");
         s.Check("DeclaredTime=22:08（PM 换算成 24 小时制）", facts.DeclaredTime == "22:08",
             $"实际 {facts.DeclaredTime ?? "null"}");
+    }
+
+    // ================================================================ 用例 Q
+
+    /// <summary>
+    /// 年份闸门：同一个话题名年年复用（「7月26日卡娜日」2024/2025/2026 都有），
+    /// 往年那批帖子会带着同样的「第N棒 / 8:00」声明时段混进来。
+    /// 只有「结构证据 + 声明时段」还不够 —— 发布年份离本场活动太远就必须拒收。
+    /// </summary>
+    private static void CaseOffYearRejected(RunState s)
+    {
+        using var http = new ChainHttp();
+        var verifier = new MatchVerifier(http);
+        var query = Query();
+
+        var from = Facts("1901", "作者A", 1901, BaseDay.AddHours(7), bar: 8, declared: "7:00");
+        var link = Link("作者B", isPrev: false, uid: "1902", barRaw: "第9棒", declaredTime: "8:00");
+
+        // ① 去年同一天发的「第 9 棒 8:00」：结构齐全、声明时段也对得上，但发布时间差了一年 → 必须拒收
+        var lastYear = Facts("1902", "作者B", 1902, BaseDay.AddYears(-1).AddHours(8), bar: 9, declared: "8:00");
+        lastYear.Prevs.Add(Link("作者A", isPrev: true, uid: "1901", declaredTime: "7:00"));
+        var outcomeLastYear = verifier.Verify(from, link, lastYear, query, WalkDirection.Forward);
+        s.Check("往年同话题帖（差 365 天）→ 拒收", !outcomeLastYear.Accepted,
+            $"Accepted={outcomeLastYear.Accepted}：{outcomeLastYear.Reason}");
+        s.Check("拒收理由写明「超出本场活动范围」",
+            outcomeLastYear.Reason.Contains("超出本场活动范围", StringComparison.Ordinal), outcomeLastYear.Reason);
+
+        // ② 提前一天发布占位（实测有这种情况：10-07 发 10-08 的 15:30 棒）→ 仍然收
+        var early = Facts("1903", "作者B", 1902, BaseDay.AddDays(-1).AddHours(15), bar: 9, declared: "8:00");
+        early.Prevs.Add(Link("作者A", isPrev: true, uid: "1901", declaredTime: "7:00"));
+        var outcomeEarly = verifier.Verify(from, link, early, query, WalkDirection.Forward);
+        s.Check("提前一天发布占位 → 仍然收", outcomeEarly.Accepted,
+            $"Accepted={outcomeEarly.Accepted}：{outcomeEarly.Reason}");
     }
 
     // ================================================================ 假实现

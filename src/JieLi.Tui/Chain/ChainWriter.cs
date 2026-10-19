@@ -416,7 +416,17 @@ public static class ChainWriter
         foreach (var v in views)
         {
             index++;
-            var pubTime = v.Facts.PubLocal == DateTime.MinValue ? "（未知）" : v.Facts.PubLocal.ToString("MM-dd HH:mm", CultureInfo.InvariantCulture);
+            var pubTime = v.Facts.PubLocal == DateTime.MinValue
+                ? "（未知）"
+                : v.Facts.PubLocal.ToString("MM-dd HH:mm", CultureInfo.InvariantCulture);
+            // 年份闸门之外的残余（人工 --add-link 加进来的、或入口帖本身跨年）要在表里一眼看得出来：
+            // 只显示「MM-dd」时，2024 年的帖看着和今年一模一样。
+            if (v.Facts.PubLocal != DateTime.MinValue
+                && query.DayStart != DateTime.MinValue
+                && v.Facts.PubLocal.Year != query.DayStart.Year)
+            {
+                pubTime = v.Facts.PubLocal.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) + " ⚠非本场年份";
+            }
             var poster = Cell(v.PosterName) + (v.PosterMid > 0 ? $"({v.PosterMid.ToString(CultureInfo.InvariantCulture)})" : "(未知)");
             sb.AppendLine($"| {index} | {Cell(BarDisplay(v))} | {Cell(Blank(v.DeclaredTime) ? "-" : v.DeclaredTime)} | {pubTime} | {poster} | {Cell(v.ResolvedAuthor)} | {ChainWalker.DirLabel(v.Node.Direction)} | {v.Node.Confidence.ToString("0.00", CultureInfo.InvariantCulture)} | {ChainWalker.MethodLabel(v.Node.Source)} | {Cell(v.Node.Ref.Url)} |");
         }

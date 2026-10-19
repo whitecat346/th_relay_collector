@@ -51,6 +51,9 @@ public sealed class MatchOutcome
 /// <summary>候选验收。</summary>
 public sealed class MatchVerifier
 {
+    /// <summary>发布时间离期望时段超过这么多天，就直接判「不是同一场活动」（同话题往年帖子）。</summary>
+    private const double YearGateDays = 3.0;
+
     private readonly ChainHttp _http;
 
     public MatchVerifier(ChainHttp http) => _http = http;
@@ -85,6 +88,23 @@ public sealed class MatchVerifier
         if (slot is { } anchor && candidate.PubLocal != DateTime.MinValue)
             diffMinutes = (int)Math.Round((candidate.PubLocal - anchor).TotalMinutes, MidpointRounding.AwayFromZero);
         outcome.DiffMinutes = diffMinutes;
+
+        // ---- 年份闸门：同一个话题每年复用（「7月26日卡娜日」这类年度活动天天有人发，
+        //      往年的棒次帖跟今年写着同样的钟点），只看「声明时段」会把 2024/2025 的帖子
+        //      收进 2026 那场（实测：2026 卡娜日混进了 2024、2025 各十几棒）。
+        //      用「发布时间离期望时段的绝对距离」兜底：活动当天 ±3 天以外一律不采信
+        //      （实测提前发布最多 1 天，留足余量；否则会误伤跨年零点那几棒）。
+        if (slot is { } gate && candidate.PubLocal != DateTime.MinValue)
+        {
+            var skewDays = (candidate.PubLocal - gate).TotalDays;
+            if (Math.Abs(skewDays) > YearGateDays)
+            {
+                outcome.Reason =
+                    $"发布时间（{candidate.PubLocal:yyyy-MM-dd HH:mm}）与期望时段（{gate:yyyy-MM-dd HH:mm}）"
+                    + $"相差 {Math.Abs(skewDays):F1} 天，超出本场活动范围（同话题往年的帖子），不采信";
+                return outcome;
+            }
+        }
 
         // ---- 时间证据之二：候选自己声明的时段（真实语料里这条比发布时间可靠）----
         // 为什么必须看它：实测有棒次提前一天发布（15:30 那棒 10-07 14:57 就占了位），

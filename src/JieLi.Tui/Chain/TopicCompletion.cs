@@ -1,5 +1,6 @@
 #nullable enable
 using System.Globalization;
+using System.Text.RegularExpressions;
 using JieLi.Tui.Data;
 
 namespace JieLi.Tui.Chain;
@@ -91,14 +92,33 @@ public sealed partial class ChainWalker
         existingSlots.Sort();
 
         // ---- 2. 挑要读的卡片：话题里存在、链上没有 ----
-        // 刻意不按发布时间过滤：实测有棒次提前一天占位（15:30 那棒 10-07 14:57 就发了），
-        // 一旦用 PubTs 卡窗口就会把它整条漏掉。是否成棒要读正文后用「声明时段」判断。
+        // 先做**年份闸门**：同一个话题每年复用（「7月26日卡娜日」这类年度活动），话题卡片里
+        // 混着 2024/2025 往年那几场。它们写着同样的钟点，只看声明时段会被当成今年的棒次
+        // （实测 2026 卡娜日补进来 2024、2025 各十几棒）。发布时间的绝对范围兜底：
+        // 只保留活动当天前后 3 天内的卡（实测提前发布最多 1 天）。
+        var sameRelay = new List<TopicCardEntry>(topic.Cards.Count);
+        var offYear = 0;
+        foreach (var card in topic.Cards)
+        {
+            if (IsNearRelayDay(card, dayStart)) sameRelay.Add(card);
+            else if (!known.Contains(card.Id)) offYear++;
+        }
+        if (offYear > 0)
+        {
+            ctx.Log?.Invoke($"[话题补全] 话题「{topic.Name}」里有 {offYear} 张卡不属于 {dayStart:yyyy-MM-dd} 这一场"
+                            + "（同话题往年的帖子），已跳过");
+            result.Warnings.Add($"话题「{topic.Name}」里有 {offYear} 张往年（非本次接力日期）的帖子，已跳过不入链。");
+        }
+
+        // 刻意不按发布时间窗口过滤：实测有棒次提前一天占位（15:30 那棒 10-07 14:57 就发了），
+        // 一旦用 PubTs 卡当天窗口就会把它整条漏掉。上面的「±3 天」已经拦住往年，够用。
         //
         // 但要省请求：卡面**没写时段**、且发布时间四舍五入到半小时后已经落在「链上已有的时段」上的，
         // 基本就是同一棒的另一稿（活动里一人多发的文章版/动态版/视频版），不必再读正文。
         // 实测 46 张卡里这一类有十几张，省下来能把总请求数压下去（用户明确担心风控）。
-        var pending = topic.Cards
+        var pending = sameRelay
             .Where(c => !known.Contains(c.Id))
+            .Where(c => !IsAnnouncementPost(c, out _))       // 「一共N棒+5EX棒」「接力名单」这类公告帖不是棒次
             .Where(c => !SkipByPubSlot(c, existingSlots, dayStart, slotOwner))
             .OrderByDescending(c => MatchVerifier.TrySlotAtLineStart(c.Text, out _)) // 卡面就写了时段的优先（信息量最大）
             .ThenBy(c => c.PubTs)
@@ -111,7 +131,8 @@ public sealed partial class ChainWalker
             return;
         }
 
-        ctx.Log?.Invoke($"[话题补全] 链上 {result.Nodes.Count} 棒，话题卡片 {topic.Cards.Count} 张，"
+        ctx.Log?.Invoke($"[话题补全] 链上 {result.Nodes.Count} 棒，话题卡片 {topic.Cards.Count} 张"
+                        + $"（本场 {sameRelay.Count} 张，跳过往年 {offYear} 张），"
                         + $"其中 {pending.Count} 张未入链 —— 逐张读正文按时段接上（上限 {MaxTopicBodyReads}）");
 
         // ---- 3. 读正文，挑出「像一棒」的卡片 ----
@@ -131,6 +152,12 @@ public sealed partial class ChainWalker
             }
             if (known.Contains(facts.PostId)) continue; // 同一帖换了 id（视频卡给 bvid，读回来是作品号）
             known.Add(facts.PostId);
+
+            if (IsAnnouncementText(facts.MergedText, out var announceWhy))
+            {
+                extras.Add($"「{ShortName(card)}」像是主办方的公告/汇总帖（命中「{announceWhy}」），未当棒次或附加帖");
+                continue;
+            }
 
             var slot = SlotOf(facts, dayStart);
             var exKind = ClassifyEx(facts, card);
@@ -277,24 +304,78 @@ public sealed partial class ChainWalker
             numbered[i].Notes.Add($"声明时段缺失，按前后相邻棒次插值为 {facts.DeclaredTime}（请核对）");
         }
 
-        // 编号：按重排后的顺序 1..N。已有显式棒号且与顺序冲突时保留显式值并记警告（声明优先，用户定的规则）。
+        // 编号：以「最近的帖内显式棒号」为锚点、按时段差 ÷ 步长换算。
+        // 不能再用「列表下标 + 1」——中间缺一棒时后面全体错位，还会和显式编号撞车
+        // （实测「7月26日卡娜日」：2:00 那棒缺，9:00 那棒本该第 10 却被推算成第 9，与 8:00 的第 9 撞号）。
+        var slotStep = 30.0;
+        var diffs = new List<double>();
+        for (var i = 0; i + 1 < numbered.Count; i++)
+        {
+            var sa = SlotOf(numbered[i].Facts!, dayStart);
+            var sb = SlotOf(numbered[i + 1].Facts!, dayStart);
+            if (sa == DateTime.MinValue || sb == DateTime.MinValue) continue;
+            var d = (sb - sa).TotalMinutes;
+            if (d >= 15 && d <= 180) diffs.Add(d);
+        }
+        if (diffs.Count > 0) slotStep = diffs.Min();
+
         var explicitConflict = 0;
+        var used = new HashSet<int>();
+        // 先占住显式棒号的号位（声明优先，显式值永远不动 —— 用户定的规则）
+        foreach (var n in numbered)
+        {
+            if (n.Facts!.BarNumber is { } declaredBar && SlotOf(n.Facts!, dayStart) != DateTime.MinValue)
+                used.Add(declaredBar);
+        }
+
         for (var i = 0; i < numbered.Count; i++)
         {
             var node = numbered[i];
             var facts = node.Facts!;
-            var guess = i + 1;
+            var slot = SlotOf(facts, dayStart);
             int? explicitBar = facts.BarNumber;
-            if (explicitBar is { } declaredBar && declaredBar != guess)
+
+            int guess;
+            var anchor = NearestExplicitBar(numbered, i, dayStart);
+            if (anchor is { } a && slot != DateTime.MinValue)
+                guess = a.Bar + (int)Math.Round((slot - a.Slot).TotalMinutes / slotStep);
+            else if (slot != DateTime.MinValue)
             {
-                explicitConflict++;
-                node.Notes.Add($"帖内声明第 {declaredBar} 棒，但按时段/时间排序是第 {guess} 棒（保留声明的 {declaredBar}，请核对是否漏棒）");
+                var firstSlot = SlotOf(numbered[0].Facts!, dayStart);
+                guess = firstSlot == DateTime.MinValue
+                    ? i + 1
+                    : 1 + (int)Math.Round((slot - firstSlot).TotalMinutes / slotStep);
+            }
+            else
+            {
+                guess = i + 1; // 既没时段也没锚点：退回排序位置
+            }
+
+            if (explicitBar is { } declaredBar)
+            {
+                if (declaredBar != guess)
+                {
+                    explicitConflict++;
+                    node.Notes.Add($"帖内声明第 {declaredBar} 棒，但按时段/时间排序是第 {guess} 棒（保留声明的 {declaredBar}，请核对是否漏棒）");
+                }
                 continue;
             }
+
+            if (used.Contains(guess))
+            {
+                // 号位被别的棒次占了（同一时段两帖、或推算偏差）：顺延到最近的空号并留痕
+                var shift = 1;
+                while (used.Contains(guess + shift) && used.Contains(guess - shift)) shift++;
+                var candidate = used.Contains(guess + shift) ? guess - shift : guess + shift;
+                node.Notes.Add($"按时段推算应为第 {guess} 棒，但该棒号已有帖（可能是同一棒的另一稿），改记第 {candidate} 棒，请核对");
+                guess = candidate;
+            }
+
+            used.Add(guess);
             facts.BarNumber = guess;
             facts.BarRaw ??= guess.ToString(CultureInfo.InvariantCulture);
-            if (explicitBar is null && facts.FieldSources.GetValueOrDefault("BarNumber") is null)
-                facts.FieldSources["BarNumber"] = "按声明时段/发布时间排序推算";
+            if (facts.FieldSources.GetValueOrDefault("BarNumber") is null)
+                facts.FieldSources["BarNumber"] = "按声明时段推算（以最近的帖内棒号为锚点）";
         }
 
         result.Nodes.Sort((a, b) => SortKey(a, dayStart).CompareTo(SortKey(b, dayStart)));
@@ -328,7 +409,58 @@ public sealed partial class ChainWalker
             true);
     }
 
+    /// <summary>
+    /// 公告帖识别：主办方「一共 24 棒 + 5 EX 棒」「接力名单」「圆满结束，我写个专栏整合」这类帖子
+    /// 会出现在同一个话题里，带「棒」字但不属于任何棒次；以前它们会被当成 EX 棒收进报告。
+    /// </summary>
+    private static bool IsAnnouncementPost(TopicCardEntry card, out string why) => IsAnnouncementText(card.Text, out why);
+
+    private static bool IsAnnouncementText(string? text, out string why)
+    {
+        why = string.Empty;
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (var pattern in AnnouncementPatterns)
+        {
+            var m = pattern.Match(text);
+            if (!m.Success) continue;
+            why = m.Value.Length > 40 ? m.Value[..40] : m.Value;
+            return true;
+        }
+        return false;
+    }
+
+    private static readonly Regex[] AnnouncementPatterns =
+    [
+        new(@"一共\s*\d+\s*棒", RegexOptions.Compiled),
+        new(@"共\s*\d+\s*棒", RegexOptions.Compiled),
+        new(@"\d+\s*棒\s*[+＋]\s*\d+\s*[Ee][Xx]\s*棒", RegexOptions.Compiled),
+        new(@"接力名单", RegexOptions.Compiled),
+        new(@"接力整合", RegexOptions.Compiled),
+        new(@"圆满结束", RegexOptions.Compiled),
+    ];
+
     // ================================================================ 小工具
+
+    /// <summary>
+    /// 在排序序列里找离 i 最近、且帖内写了棒号的节点（先往前找、再往后找）。
+    /// 用于「按声明时段推算棒号」：只有显式棒号能当锚点，缺棒导致的整体错位才不会传染。
+    /// </summary>
+    private static (int Bar, DateTime Slot)? NearestExplicitBar(List<ChainNode> numbered, int i, DateTime dayStart)
+    {
+        for (var step = 1; step < numbered.Count; step++)
+        {
+            foreach (var j in new[] { i - step, i + step })
+            {
+                if (j < 0 || j >= numbered.Count) continue;
+                var f = numbered[j].Facts!;
+                if (f.BarNumber is not { } bar) continue;
+                var s = SlotOf(f, dayStart);
+                if (s == DateTime.MinValue) continue;
+                return (bar, s);
+            }
+        }
+        return null;
+    }
 
     /// <summary>把话题卡片转成可读的 PostRef（视频卡给 bvid，动态/文章卡给 opus id）。</summary>
     private static PostRef CardToRef(TopicCardEntry card)
@@ -412,6 +544,25 @@ public sealed partial class ChainWalker
         if (facts.Prevs.Count > 0 || facts.Nexts.Count > 0) return true;
         var text = facts.MergedText;
         return !string.IsNullOrEmpty(text) && text.Contains('棒');
+    }
+
+    /// <summary>
+    /// 卡片的发布时间是不是落在这一场活动的日子附近。
+    /// </summary>
+    /// <remarks>
+    /// 同一个话题每年复用（「7月26日卡娜日」这种年度活动），话题卡片里混着往年那几场；
+    /// 它们写着同样的钟点，若只按「声明时段」归位，就会把 2024/2025 的棒次当成今年这一场补进来
+    /// （实测 2026 卡娜日补进了 2024、2025 各十几棒）。允许活动前后各 3 天（实测有棒次提前一天发布占位）。
+    /// </remarks>
+    private static bool IsNearRelayDay(TopicCardEntry card, DateTime dayStart)
+    {
+        if (card.PubTs <= 0) return true; // 拿不到时间戳的留着，靠读正文与验收判
+        var pub = DateTimeOffset.FromUnixTimeSeconds(card.PubTs).LocalDateTime;
+        // ±3 天太松：话题「7月26日卡娜日」里连着好几年都有帖，还会混进同一年的「后日谈 / 别的日子」，
+        // 那些帖子自己写着「第N棒 8:00」，一旦被套到本场 dayStart 上就变成幽灵棒次。
+        // 实测本场棒次最早提前 1 天发布（10-07 发 10-08 的棒），当天结束后最多再刷一天多的花絮，
+        // 所以收紧成「前一天 0 点 ~ 次日中午」。
+        return pub >= dayStart.Date.AddDays(-2) && pub < dayStart.Date.AddDays(1.5);
     }
 
     /// <summary>
