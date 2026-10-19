@@ -78,6 +78,33 @@ public static class NeighborExtractor
         @"(?m)^[ \t　]*(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})\s*(?:棒|[|｜丨])",
         RegexOptions.Compiled);
 
+    /// <summary>
+    /// 行首裸时段（最宽松的兜底）：「16：30！」「18:30 阿雯@藏粮阁魔导书」
+    /// 「19:00 作者:@羽衣的皇带鱼」。本场语料（topic 1349127）的时段不一定后接
+    /// @ / 棒 / |，所以只认「行首（允许缩进）+ 1~2 位小时 + 冒号 + 2 位分钟」。
+    /// `(?![0-9])` 必须保留：否则「172:30」这种数字串会被切出假时段。
+    /// 它排在 DeclaredTime 的最后才用，既有写法（第N棒 23:00 / 【…16：00】/ 20:30 |）一个都不会被改坏。
+    /// </summary>
+    private static readonly Regex LineStartTimeRegex = new(
+        @"(?m)^[ \t　]*(?<h>[0-9]{1,2})[:：](?<m>[0-9]{2})(?![0-9])", RegexOptions.Compiled);
+
+    /// <summary>
+    /// 行首时段后的 12 小时制标记：实测本场语料「10:08 PM」= 22:08，
+    /// 与上午的「10:08」是两个不同的棒，所以必须换算成 24 小时制，不能直接记 10:08。
+    /// </summary>
+    private static readonly Regex MeridiemRegex = new(
+        @"^[ \t]*(?<mer>AM|PM)(?![A-Za-z])", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// 行首「时段 + 名字@账号」：「18:30 阿雯@藏粮阁魔导书」。
+    /// 名字是真正的创作者，@ 后面的账号是发布账号（别人）——代发归属。
+    /// 名字串排除 `：:`，这样「5：00 代发：@X」「10:08 约稿：@X」不会被当成这种形态。
+    /// </summary>
+    private static readonly Regex LineStartSlotNameAccountRegex = new(
+        @"(?m)^[ \t　]*(?<h>[0-9]{1,2})\s*[:：]\s*(?<m>[0-9]{2})(?![0-9])[ \t]*" +
+        @"(?<name>[^\s@＠、，。；;：:|｜（）()\[\]【】<>]{1,30})[ \t]*@(?<acct>[^\s@＠、，。；;：:|｜（）()\[\]【】<>]{1,30})",
+        RegexOptions.Compiled);
+
     private static readonly Regex LastMarkRegex = new(
         @"(?<kw>最后一棒|最后1棒|末棒|终棒|收官|收尾|完结)", RegexOptions.Compiled);
 
@@ -112,6 +139,15 @@ public static class NeighborExtractor
     /// <summary>强代发信号：原作者/原画师…（说明发布者不是真正创作者）。</summary>
     private static readonly Regex StrongCreatorRegex = new(
         @"(?:原作者|原画师|原绘师|原文本|原曲|原案)\s*[:：]\s*@?\s*(?<who>[^\s@＠（(、,，。；;|｜\n]{1,30})",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// 正文署名：「作者：@羽衣的皇带鱼」。这是本场语料里最直接的创作者声明，
+    /// 与发布账号不同即视为代发（规范优先级①）。
+    /// 注意 `原作者：X` 也会命中（子串），语义一致，无需单独区分。
+    /// </summary>
+    private static readonly Regex AuthorLabelRegex = new(
+        @"作者\s*[:：]\s*@?\s*(?<who>[^\s@＠、，。；;：:|｜（）()\[\]【】<>]{1,30})",
         RegexOptions.Compiled);
 
     /// <summary>弱署名信号：只写「画师：X」时通常只是署名，不一定是代发，不据此置 IsProxy。</summary>
@@ -311,6 +347,12 @@ public static class NeighborExtractor
 
         if (afterBarTime is not null) return afterBarTime;
 
+        // 第一行有内容的行若以「HH:MM …」开头，它就是本棒声明（本场每一棒都这么写）。
+        // 正文后文里的「18:30点棒」只是引用，属最弱信号，必须排在这条之后，
+        // 否则「10:08 PM 阿雯」这种帖会被后文引用抢成 18:30。
+        var firstLineTime = FirstContentLineTime(selfText);
+        if (firstLineTime is not null) return firstLineTime;
+
         var standalone = StandaloneTimeRegex.Match(selfText);
         if (standalone.Success)
         {
@@ -339,6 +381,39 @@ public static class NeighborExtractor
         var titleBar = BarRegex.Match(title);
         if (titleBar.Success) return TimeAfterBar(title, titleBar.Index + titleBar.Length);
 
+        // 最后兜底：行首裸时段。本场真实语料里「16：30！」「18:30 阿雯@…」
+        // 「19:00 作者:@…」都不带 @/棒/| 紧随，上面的精确规则全漏；
+        // 放在最后是为了不改坏任何既有写法（第N棒 23:00 / 【…16：00】/ 20:30 |）。
+        foreach (Match lineStart in LineStartTimeRegex.Matches(selfText))
+        {
+            if (TrySlotTime(lineStart, selfText, out var slotTime)) return slotTime;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 取「第一行有内容的行」行首的 HH:MM 时段；没有则返回 null。
+    /// 为什么要单独判：正文里出现「18:30点棒」往往只是引用（如「其实是18:30点棒的插图」），
+    /// 而首行行首的时段才是本棒声明，所以它必须排在 StandaloneTimeRegex 之前。
+    /// </summary>
+    private static string? FirstContentLineTime(string selfText)
+    {
+        var lineStart = 0;
+        while (lineStart < selfText.Length)
+        {
+            var lineEnd = selfText.IndexOf('\n', lineStart);
+            if (lineEnd < 0) lineEnd = selfText.Length;
+            var line = selfText[lineStart..lineEnd];
+            if (line.Trim().Length > 0)
+            {
+                var match = LineStartTimeRegex.Match(line);
+                return match.Success && TrySlotTime(match, line, out var time) ? time : null;
+            }
+
+            lineStart = lineEnd + 1;
+        }
+
         return null;
     }
 
@@ -352,12 +427,61 @@ public static class NeighborExtractor
             : null;
     }
 
+    /// <summary>校验 regex 里的 h/m 组是否落在合法 24 小时制范围内（小时 0..24、分钟 0..59）。</summary>
+    private static bool TryValidHourMinute(Match match)
+    {
+        if (!int.TryParse(match.Groups["h"].Value, out var hour)) return false;
+        if (!int.TryParse(match.Groups["m"].Value, out var minute)) return false;
+        return hour is >= 0 and <= 24 && minute is >= 0 and <= 59;
+    }
+
+    /// <summary>
+    /// 行首时段 → 「H:mm」（24 小时制、分钟两位、半角冒号）。
+    /// 顺带处理 12 小时制标记：本场语料「10:08 PM」= 22:08，与上午的「10:08」是两个不同的棒。
+    /// </summary>
+    private static bool TrySlotTime(Match match, string text, out string time)
+    {
+        time = string.Empty;
+        if (!TryValidHourMinute(match)) return false;
+        if (!int.TryParse(match.Groups["h"].Value, out var hour)) return false;
+        if (!int.TryParse(match.Groups["m"].Value, out var minute)) return false;
+
+        var tailStart = match.Index + match.Length;
+        if (tailStart < text.Length)
+        {
+            var tail = text[tailStart..Math.Min(text.Length, tailStart + 8)];
+            var meridiem = MeridiemRegex.Match(tail);
+            if (meridiem.Success)
+            {
+                // 12 小时制下小时只能 1..12；「23:00 PM」这种非法写法直接放弃。
+                if (hour is < 1 or > 12) return false;
+                var pm = meridiem.Groups["mer"].Value.Equals("PM", StringComparison.OrdinalIgnoreCase);
+                hour = pm ? (hour == 12 ? 12 : hour + 12) : (hour == 12 ? 0 : hour);
+            }
+        }
+
+        if (hour is < 0 or > 24) return false;
+        time = $"{hour}:{minute:00}";
+        return true;
+    }
+
+    /// <summary>名字串恰好是 AM/PM 时不是名字（「10:08 PM @X」里的 PM）。</summary>
+    private static bool IsMeridiemWord(string word) =>
+        word.Length == 2
+        && (word.Equals("AM", StringComparison.OrdinalIgnoreCase) || word.Equals("PM", StringComparison.OrdinalIgnoreCase));
+
     // -----------------------------------------------------------------------
     // 代发 / 原作者
     // -----------------------------------------------------------------------
 
     private static void DetectProxy(PostFacts facts, string selfText)
     {
+        // 规范优先级①~③：正文声明的创作者优先于发布账号，命中即停。
+        // 命中后旧的「代发/署名」规则仍然会跑，但它们一律用 ??= 或只置 true，不会覆盖已判定的归属。
+        _ = TryAuthorLabel(facts, selfText)
+            || TrySlotNameAccount(facts, selfText)
+            || TrySlotAtMention(facts, selfText);
+
         // ①「X（@Y 代发）」：X 是被代发的真正创作者，Y 是代发人。
         var pair = ProxyPairRegex.Match(selfText);
         if (pair.Success)
@@ -372,9 +496,9 @@ public static class NeighborExtractor
             }
         }
 
-        // ②「原作者：X」/「原画师：X」：强信号。
+        // ②「原作者：X」/「原画师：X」：强信号；但鸣谢行里的「原画师」是谢辞，不算归属。
         var strong = StrongCreatorRegex.Match(selfText);
-        if (strong.Success)
+        if (strong.Success && !IsAcknowledgementLine(selfText, strong.Index))
         {
             var who = TextNormalizer.CleanMention(strong.Groups["who"].Value);
             if (who.Length > 0 && !IsProxyWord(who))
@@ -385,12 +509,14 @@ public static class NeighborExtractor
         }
 
         // ③「画师：X」这类只是署名，不置 IsProxy（否则普通画师帖全成代发）。
-        var soft = SoftCreditRegex.Match(selfText);
-        if (soft.Success)
+        // 同样跳过「鸣谢…画师：X」「感谢约稿插图作者：X」这种谢辞行。
+        foreach (Match soft in SoftCreditRegex.Matches(selfText))
         {
+            if (IsAcknowledgementLine(selfText, soft.Index)) continue;
             var who = TextNormalizer.CleanMention(soft.Groups["who"].Value);
             if (who.Length > 0 && !IsProxyWord(who) && !TextNormalizer.SameName(who, facts.AuthorName))
                 facts.CreatorInText ??= who;
+            break;
         }
 
         // ④ 只写了「本作为代发」/「代发（…」没写主体。
@@ -410,6 +536,108 @@ public static class NeighborExtractor
     }
 
     private static bool IsProxyWord(string word) => ProxyWords.Contains(word, StringComparer.Ordinal);
+
+    /// <summary>
+    /// 这一行在「作者：/画师：」之前是不是鸣谢语境。
+    /// 例：「鸣谢约稿插图作者：@SAM271」是谢辞，不是本条创作者归属（13:00 蔼石那帖就是这种）。
+    /// </summary>
+    private static bool IsAcknowledgementLine(string text, int matchIndex)
+    {
+        var lineStart = text.LastIndexOf('\n', Math.Max(0, matchIndex - 1));
+        var prefix = text[(lineStart + 1)..matchIndex];
+        return prefix.Contains("鸣谢", StringComparison.Ordinal)
+            || prefix.Contains("感谢", StringComparison.Ordinal)
+            || prefix.Contains("致谢", StringComparison.Ordinal)
+            || prefix.Contains("约稿", StringComparison.Ordinal)
+            || prefix.Contains("插图", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 规范优先级①：正文「作者：@X」——X 就是本条声明的创作者，与发布者不同即视为代发。
+    /// 「鸣谢约稿插图作者：@SAM271」这类鸣谢/致谢行不算创作者归属，所以先看「作者：」同一行前面有没有那些词。
+    /// </summary>
+    private static bool TryAuthorLabel(PostFacts facts, string selfText)
+    {
+        foreach (Match match in AuthorLabelRegex.Matches(selfText))
+        {
+            if (IsAcknowledgementLine(selfText, match.Index)) continue;
+
+            var who = TextNormalizer.CleanMention(match.Groups["who"].Value);
+            if (who.Length == 0 || IsProxyWord(who)) continue;
+
+            facts.CreatorInText ??= who;
+            if (!TextNormalizer.SameName(who, facts.AuthorName)) facts.IsProxy = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 规范优先级②：行首「时段 名字@账号」（18:30 阿雯@藏粮阁魔导书）——
+    /// 名字才是创作者，@ 后面的账号是发布账号（别人），判为代发。
+    /// </summary>
+    private static bool TrySlotNameAccount(PostFacts facts, string selfText)
+    {
+        foreach (Match match in LineStartSlotNameAccountRegex.Matches(selfText))
+        {
+            if (!TryValidHourMinute(match)) continue;
+
+            var name = TextNormalizer.CleanMention(match.Groups["name"].Value);
+            if (name.Length == 0 || IsMeridiemWord(name) || IsProxyWord(name) || IsSelfPronoun(name)) continue;
+            // 名字就是发布者本人：不算代发（例如「10:08 PM @交联纤维素」被误配成「PM@交联纤维素」）。
+            if (TextNormalizer.SameName(name, facts.AuthorName)) continue;
+
+            facts.CreatorInText ??= name;
+            facts.IsProxy = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 规范优先级③：行首「时段 @名」（17:00 @茶猫祈祷中）——名与发布者不同、
+    /// 且**确实出现在真实 @ 组件（Mentions）里**，才算创作者；这样「上一棒：@X」
+    /// 「感谢 @X」之类不会被误判。
+    /// </summary>
+    private static bool TrySlotAtMention(PostFacts facts, string selfText)
+    {
+        foreach (Match time in LineStartTimeRegex.Matches(selfText))
+        {
+            if (!TrySlotTime(time, selfText, out _)) continue;
+
+            var lineEnd = selfText.IndexOf('\n', time.Index + time.Length);
+            if (lineEnd < 0) lineEnd = selfText.Length;
+            var rest = selfText[(time.Index + time.Length)..lineEnd].TrimStart(' ', '\t');
+            if (rest.Length == 0 || (rest[0] != '@' && rest[0] != '＠')) continue;
+
+            var at = AtNameRegex.Match(rest);
+            if (!at.Success) continue;
+
+            var name = TextNormalizer.CleanMention(at.Groups["name"].Value);
+            if (name.Length == 0 || IsProxyWord(name) || IsSelfPronoun(name)) continue;
+            if (TextNormalizer.SameName(name, facts.AuthorName)) continue;
+            if (!InMentions(facts, name)) continue;
+
+            facts.CreatorInText ??= name;
+            facts.IsProxy = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>名字是否真的出现在本条的被 @ 列表里（必须，否则普通正文里的 @ 会被误判成创作者）。</summary>
+    private static bool InMentions(PostFacts facts, string name)
+    {
+        foreach (var mention in facts.Mentions)
+        {
+            if (mention.Name.Length > 0 && TextNormalizer.SameName(mention.Name, name)) return true;
+        }
+
+        return false;
+    }
 
     // -----------------------------------------------------------------------
     // 邻居（上一棒 / 下一棒）

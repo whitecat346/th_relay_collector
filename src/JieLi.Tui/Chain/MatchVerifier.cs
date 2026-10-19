@@ -86,15 +86,50 @@ public sealed class MatchVerifier
             diffMinutes = (int)Math.Round((candidate.PubLocal - anchor).TotalMinutes, MidpointRounding.AwayFromZero);
         outcome.DiffMinutes = diffMinutes;
 
-        var window = query.WindowMinutes > 0 ? query.WindowMinutes : 90;
-        var inWindow = diffMinutes is { } d && Math.Abs(d) <= window;
+        // ---- 时间证据之二：候选自己声明的时段（真实语料里这条比发布时间可靠）----
+        // 为什么必须看它：实测有棒次提前一天发布（15:30 那棒 10-07 14:57 就占了位），
+        // 发布时间离活动当天差 20 小时，纯按 PubTs 判会被当成「超窗」扔掉；
+        // 而帖子里明明白白写着「15：30@某人」。人工整理时也是按声明时段归位的。
+        int? declaredDiff = null;
+        DateTime? declaredSlot = null;
+        if (slot is { } anchor2 && TryParseHourMinute(candidate.DeclaredTime, out var candMinutes))
+        {
+            declaredSlot = PickSlotDay(anchor2, candMinutes, dir);
+            declaredDiff = (int)Math.Round((declaredSlot.Value - anchor2).TotalMinutes, MidpointRounding.AwayFromZero);
+        }
 
-        var parts = new List<string>(3);
+        var window = query.WindowMinutes > 0 ? query.WindowMinutes : 90;
+        var pubInWindow = diffMinutes is { } d && Math.Abs(d) <= window;
+
+        // 声明时段的容差单独收紧：它是「帖子里写死的钟点」，不是「可能延误的发布时间」。
+        // 用整个窗口（默认 ±90）会让相邻棒/附加帖冒充目标棒——实测那张 22:08 发布的
+        // 「美丽与思念之旅SP」声明 18:30，被当成 19:00 那棒收下，把真正的 19:00 挤掉了。
+        // 一个棒次间隔通常是 30 分钟，所以 35 分钟就够容忍「四舍五入 + 半格误差」。
+        var declaredTolerance = Math.Min(window, 35);
+        var declaredInWindow = declaredDiff is { } dd && Math.Abs(dd) <= declaredTolerance;
+
+        // 方向一致性：正向找「下一棒」时，候选不该自称比期望时段更早的棒次
+        // （那说明它是刚走过的那一棒的另一稿/附加帖）；反向同理。
+        // 允许 15 分钟以内的偏差，避免整点/半点附近的取整把正常棒次误杀。
+        var declaredDirectionConflict = declaredDiff is { } ddd &&
+            (dir == WalkDirection.Forward ? ddd < -15 : dir == WalkDirection.Backward && ddd > 15);
+        if (declaredDirectionConflict) declaredInWindow = false;
+
+        var inWindow = pubInWindow || declaredInWindow;
+
+        var parts = new List<string>(4);
         if (structural.Matched) parts.Add(structural.Description);
         if (diffMinutes is { } diff)
             parts.Add($"发布时间与期望时段（{slot!.Value:yyyy-MM-dd HH:mm}）相差 {diff} 分钟，窗口 ±{window}");
         else
             parts.Add("没有可用的时间锚点（源帖发布时间/声明时段都拿不到）");
+        if (declaredDiff is { } dj)
+        {
+            var verdict = declaredDirectionConflict
+                ? "，但方向不符（找下一棒/上一棒时它自称更早/更晚的棒次，可能是同一棒的另一稿），不采信"
+                : declaredInWindow ? $"，在 ±{declaredTolerance} 分钟内" : $"，超出 ±{declaredTolerance} 分钟";
+            parts.Add($"候选声明时段「{candidate.DeclaredTime}」与期望时段相差 {dj} 分钟{verdict}");
+        }
 
         // ① 结构证据（权重最高：一人可多棒，发布时间说明不了是不是同一棒）
         if (structural.Matched)
@@ -113,7 +148,7 @@ public sealed class MatchVerifier
         {
             outcome.Accepted = true;
             outcome.Confidence = 0.6;
-            outcome.MatchedBy = "时间窗";
+            outcome.MatchedBy = declaredInWindow && !pubInWindow ? "声明时段" : "时间窗";
             outcome.Reason = string.Join("；", parts);
             return outcome;
         }
@@ -245,6 +280,94 @@ public sealed class MatchVerifier
         if (h is < 0 or > 47 || m is < 0 or > 59) return false;
         minutes = h * 60 + m;
         return true;
+    }
+
+    // ------------------------------------------------------------------ 候选排序
+
+    /// <summary>
+    /// 行首的「HH:MM」时段（允许前导空格/全角空格；小时 0..24）。
+    /// 只认行首：正文里随口提到的时间（「我写到 23:00 才睡」）不能当棒位声明。
+    /// </summary>
+    internal static bool TrySlotAtLineStart(string? text, out string normalized)
+    {
+        normalized = "";
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        foreach (var rawLine in text.Split('\n'))
+        {
+            var line = rawLine.Trim(' ', '\t', '\u3000', '\r');
+            if (line.Length == 0) continue;
+            var m = System.Text.RegularExpressions.Regex.Match(line, @"^(\d{1,2})[:：](\d{2})(?!\d)");
+            if (!m.Success) return false; // 只看第一行有内容的行
+            if (!int.TryParse(m.Groups[1].Value, out var h) || !int.TryParse(m.Groups[2].Value, out var mi)) return false;
+            if (h is < 0 or > 24 || mi is < 0 or > 59) return false;
+            normalized = $"{h:00}:{mi:00}";
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 候选（还没读正文）的排序分：越可能「就是那一棒」越靠前 —— 读详情最贵，要先读对的。
+    /// 实测依据：同一作者同一时间段常见两帖（文章版 + 动态版；21:30 动态 + 21:35 视频），
+    /// 人工整理时选的是「正文/首行声明了那个时段、非专栏」的那张。
+    /// </summary>
+    public static int CandidateScore(PostCandidate cand, DateTime? slot, WalkDirection dir)
+    {
+        var score = 0;
+
+        var hasSlot = TrySlotAtLineStart(cand.Title, out var candSlot);
+        if (hasSlot && slot is not null && TryParseHourMinute(candSlot, out var cm))
+        {
+            var expected = PickSlotDay(slot.Value, cm, dir);
+            var diff = Math.Abs((expected - slot.Value).TotalMinutes);
+            score += diff <= 30 ? 60 : diff <= 90 ? 20 : 0;
+        }
+        else if (hasSlot)
+        {
+            score += 15; // 至少声明了时段（活动通常有），比什么都没有的强
+        }
+
+        if (cand.Title.Contains('棒')) score += 15;
+        if (cand.Title.Contains("上一棒") || cand.Title.Contains("下一棒")) score += 15;
+
+        if (cand.PubTs > 0 && slot is DateTime anchor)
+        {
+            var pub = DateTimeOffset.FromUnixTimeSeconds(cand.PubTs).ToLocalTime().DateTime;
+            var mins = Math.Abs((pub - anchor).TotalMinutes);
+            score += mins <= 90 ? 20 : mins <= 180 ? 5 : 0;
+        }
+
+        // 专栏（文章）与动态常常是同一棒的两种稿；人工整理选动态，所以文章只作兜底
+        if (cand.Method == FetchMethod.ArticleSearch) score -= 15;
+        return score;
+    }
+
+    /// <summary>
+    /// 读过正文之后的排序分：在通过验收的候选里挑「最像那一棒」的那张。
+    /// 与 <see cref="CandidateScore"/> 同一套价值取向（声明时段 &gt; 非文章 &gt; 有上下棒 &gt; 有正文），
+    /// 只是因为拿到了 <see cref="PostFacts"/>，判定可以更硬。
+    /// </summary>
+    public static int RankScore(PostFacts facts, MatchOutcome outcome, DateTime? slot, WalkDirection dir)
+    {
+        var score = (int)Math.Round(outcome.Confidence * 10, MidpointRounding.AwayFromZero);
+
+        if (outcome.MatchedBy.Contains("声明时段", StringComparison.Ordinal)) score += 60;
+
+        if (slot is DateTime anchor && TryParseHourMinute(facts.DeclaredTime, out var mins))
+        {
+            var declared = PickSlotDay(anchor, mins, dir);
+            var diff = Math.Abs((declared - anchor).TotalMinutes);
+            score += diff <= 30 ? 30 : diff <= 60 ? 20 : 0;
+        }
+
+        var isArticle = facts.WorkKindLabel is not null && facts.WorkKindLabel.Contains("文章", StringComparison.Ordinal);
+        if (!isArticle) score += 14;
+
+        if (facts.Prevs.Count + facts.Nexts.Count > 0) score += 8;
+        if (facts.BodyText.Length >= 10) score += 6;
+
+        if (outcome.DiffMinutes is { } d) score -= Math.Min(Math.Abs(d), 1000) / 20;
+        return score;
     }
 
     // ------------------------------------------------------------------ 弱证据

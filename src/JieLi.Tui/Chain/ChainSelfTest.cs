@@ -54,6 +54,14 @@ public static class ChainSelfTest
         state.Case("I 验收分级：结构/时间/弱证据的置信度与拒收", CaseVerifierGrades);
         state.Case("J 日期与 slug 推导：未给 --date 时用入口帖发布日，Year==1 时补年份", CaseDateAndSlug);
 
+        // K~P 是抽取器（NeighborExtractor）的回归用例：只喂文章正文，不联网、不碰遍历器。
+        state.Case("K 行首时段「16：30！」：全角冒号 + 感叹号独立行也认", CaseLineStartTimeFullWidthBang);
+        state.Case("L 行首时段「15：30@反应迟顿」：全角冒号紧跟 @ 也认", CaseLineStartTimeGluedAt);
+        state.Case("M 创作者归属：18:30 阿雯@藏粮阁魔导书 → 创阿雯/代发", CaseSlotNameAccountCreator);
+        state.Case("N 创作者归属：19:00 作者:@羽衣的皇带鱼 → 创羽衣的皇带鱼/代发", CaseAuthorLabelCreator);
+        state.Case("O 鸣谢行不是作者归属：13:00 @蔼石 + 鸣谢约稿插图作者：@SAM271", CaseAcknowledgementNotCreator);
+        state.Case("P AM/PM 换算：10:08 PM @交联纤维素 → 22:08", CaseMeridiemTime);
+
         state.Line($"  遍历器与落盘用例：通过 {state.Passed}，失败 {state.Failed}");
         return new ChainSelfTestResult { Passed = state.Passed, Failed = state.Failed };
     }
@@ -465,6 +473,53 @@ public static class ChainSelfTest
         s.Check("孤立帖不崩：节点=1", result.Nodes.Count == 1, $"实际 {result.Nodes.Count}");
     }
 
+    // ================================================================ 用例 K~P：抽取器回归
+
+    private static void CaseLineStartTimeFullWidthBang(RunState s)
+    {
+        var facts = Extracted("龙胆紫苑", "16：30！");
+        s.Check("DeclaredTime=16:30（全角冒号归一成半角）", facts.DeclaredTime == "16:30",
+            $"实际 {facts.DeclaredTime ?? "null"}");
+    }
+
+    private static void CaseLineStartTimeGluedAt(RunState s)
+    {
+        var facts = Extracted("反应迟顿", "15：30@反应迟顿");
+        s.Check("DeclaredTime=15:30（全角冒号紧贴 @ 仍认）", facts.DeclaredTime == "15:30",
+            $"实际 {facts.DeclaredTime ?? "null"}");
+    }
+
+    private static void CaseSlotNameAccountCreator(RunState s)
+    {
+        var facts = Extracted("藏粮阁魔导书", "18:30 阿雯@藏粮阁魔导书\n下一棒：@羽衣的皇带鱼", "阿雯", "藏粮阁魔导书", "羽衣的皇带鱼");
+        s.Check("18:30 / 创阿雯 / 代发（名字@账号形态，取第一个名字）",
+            facts.DeclaredTime == "18:30" && facts.CreatorInText == "阿雯" && facts.IsProxy,
+            $"实际 time={facts.DeclaredTime ?? "null"} creator={facts.CreatorInText ?? "null"} proxy={facts.IsProxy}");
+    }
+
+    private static void CaseAuthorLabelCreator(RunState s)
+    {
+        var facts = Extracted("龙胆紫苑", "19:00 作者:@羽衣的皇带鱼", "羽衣的皇带鱼", "藏粮阁魔导书");
+        s.Check("19:00 / 创羽衣的皇带鱼 / 代发（作者: 标注优先）",
+            facts.DeclaredTime == "19:00" && facts.CreatorInText == "羽衣的皇带鱼" && facts.IsProxy,
+            $"实际 time={facts.DeclaredTime ?? "null"} creator={facts.CreatorInText ?? "null"} proxy={facts.IsProxy}");
+    }
+
+    private static void CaseAcknowledgementNotCreator(RunState s)
+    {
+        var facts = Extracted("蔼石", "13:00 @蔼石\n鸣谢约稿插图作者：@SAM271", "蔼石", "SAM271");
+        s.Check("13:00 / 无创作者 / 不算代发（鸣谢行的作者：不是归属）",
+            facts.DeclaredTime == "13:00" && facts.CreatorInText is null && !facts.IsProxy,
+            $"实际 time={facts.DeclaredTime ?? "null"} creator={facts.CreatorInText ?? "null"} proxy={facts.IsProxy}");
+    }
+
+    private static void CaseMeridiemTime(RunState s)
+    {
+        var facts = Extracted("交联纤维素", "10:08 PM @交联纤维素", "交联纤维素");
+        s.Check("DeclaredTime=22:08（PM 换算成 24 小时制）", facts.DeclaredTime == "22:08",
+            $"实际 {facts.DeclaredTime ?? "null"}");
+    }
+
     // ================================================================ 假实现
 
     /// <summary>假 reader：从内存字典里取帖子；没有就抛 ChainFetchException（和真 reader 一样）。</summary>
@@ -512,6 +567,9 @@ public static class ChainSelfTest
 
         /// <summary>自检里没有真实话题接口，忽略即可（假 locator 直接按用户表返回）。</summary>
         public void PrimeTopic(long? topicId) { }
+
+        /// <summary>自检里没有话题卡片索引，返回 null 让遍历器跳过「按话题时间表补全」。</summary>
+        public TopicIndex? EnsureTopic(Action<string>? log, CancellationToken ct) => null;
     }
 
     // ================================================================ 测试脚手架
@@ -589,6 +647,34 @@ public static class ChainSelfTest
             BodyText = "接力测试正文 " + postId,
             MergedText = "接力测试正文 " + postId + "，作者 " + author,
         };
+    }
+
+    /// <summary>
+    /// 只跑抽取器（NeighborExtractor.Extract），造一条最小 PostFacts：不联网、不碰遍历器。
+    /// 正文给什么就抽什么，用于「段首时段 / 创作者归属」的回归用例。
+    /// </summary>
+    private static PostFacts Extracted(string author, string body, params string[] mentionNames)
+    {
+        var facts = new PostFacts
+        {
+            PostId = "9001",
+            Kind = PostKind.Opus,
+            Url = "https://www.bilibili.com/opus/9001",
+            AuthorUid = 9001,
+            AuthorName = author,
+            PubTs = ToUnix(BaseDay.AddHours(22)),
+            RelayName = "东方接力测试",
+            Title = string.Empty,
+            BodyText = body,
+            MergedText = body,
+        };
+        foreach (var name in mentionNames)
+        {
+            facts.Mentions.Add(new AtMention { Name = name, Ordinal = facts.Mentions.Count });
+        }
+
+        NeighborExtractor.Extract(facts);
+        return facts;
     }
 
     private static NeighborLink Link(string name, bool isPrev, string? uid = null, string? barRaw = null, string? declaredTime = null)

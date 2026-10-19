@@ -29,7 +29,7 @@ namespace JieLi.Tui.Chain;
 // ===========================================================================
 
 /// <summary>双向 BFS 遍历器。</summary>
-public sealed class ChainWalker
+public sealed partial class ChainWalker
 {
     // 审计里约定的两个统计步：报告要写「请求数 / 是否用了登录态」，但 ChainResult 是冻结契约
     // 不能加字段，所以借 Audit 传递（ChainWriter 读这两个 Step 的 Detail）。
@@ -165,6 +165,10 @@ public sealed class ChainWalker
             result.Warnings.Add("Forward 方向没有走到显式末棒标记（可能漏标 / 链路不完整，缺口见清单）");
         if (!ctx.Backward.Stopped)
             result.Warnings.Add("Backward 方向没有走到显式首棒标记（可能漏标 / 链路不完整，缺口见清单）");
+
+        // 收尾补全：@ 链常常在「没写上一棒」的地方断开（实测存在），这时用话题卡片时间表把缺的棒接回来。
+        // 放在 InferChainBars 之前：补进来的棒次也参与「从相邻指认推棒号」。
+        CompleteFromTopic(ctx);
 
         InferChainBars(ctx);
         FinishResult(ctx);
@@ -580,11 +584,14 @@ public sealed class ChainWalker
                 });
         }
 
-        // ---- ③ 排序：离「期望时段」最近的先读（读详情最贵，一条一条来）----
+        // ---- ③ 排序：先读「最像那一棒」的（声明时段/非专栏/带上下棒/发布时间靠近）----
+        // 同一作者同窗多帖很常见（文章版 vs 动态版、21:30 动态 vs 21:35 视频），
+        // 以前只顾「发布时间离期望时段最近、id 靠前」，会读到那篇空文本的，人工整理时不是这么选的。
         var slot = MatchVerifier.ExpectedSlot(from, link, dir);
         var ordered = candidates
             .Where(c => InSearchWindow(c, ctx.Query))
-            .OrderBy(c => DistanceToSlot(c, slot))
+            .OrderByDescending(c => MatchVerifier.CandidateScore(c, slot, dir))
+            .ThenBy(c => DistanceToSlot(c, slot))
             .ThenByDescending(c => c.PubTs)
             .Take(MaxCandidateReads)
             .ToList();
@@ -619,14 +626,19 @@ public sealed class ChainWalker
                 Detail = $"{key}「{candFacts.AuthorName}」→ {(outcome.Accepted ? "收下" : "拒收")}：{outcome.Reason}",
                 Success = outcome.Accepted,
             });
-            if (outcome.Accepted) read.Add(new ReadCandidate(cand, candFacts, outcome));
+            if (outcome.Accepted)
+            {
+                read.Add(new ReadCandidate(cand, candFacts, outcome));
+                // 已经读到「声明时段正好对上 + 非专栏」的那张，就是这一棒了，不再多读（省请求、省风控）
+                if (MatchVerifier.RankScore(candFacts, outcome, slot, dir) >= 90) break;
+            }
             else rejected.Add($"{key}: {outcome.Reason}");
         }
 
         // ---- ⑤ 选要走的下一棒：优先从没走过的候选里挑；都已走过则做相遇/环判定 ----
         var fresh = read
             .Where(r => !IsVisited(ctx, r.Facts, r.Candidate.Ref))
-            .OrderByDescending(r => r.Outcome.Confidence)
+            .OrderByDescending(r => MatchVerifier.RankScore(r.Facts, r.Outcome, slot, dir))
             .ThenBy(r => Math.Abs(r.Outcome.DiffMinutes ?? int.MaxValue))
             .ToList();
         if (fresh.Count > 0) return FoundNode(ctx, node, link, dir, fresh[0]);
@@ -634,7 +646,7 @@ public sealed class ChainWalker
         if (read.Count > 0)
         {
             var best = read
-                .OrderByDescending(r => r.Outcome.Confidence)
+                .OrderByDescending(r => MatchVerifier.RankScore(r.Facts, r.Outcome, slot, dir))
                 .ThenBy(r => Math.Abs(r.Outcome.DiffMinutes ?? int.MaxValue))
                 .First();
             var bestKey = KeyOf(best.Facts, best.Candidate.Ref);

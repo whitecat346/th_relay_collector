@@ -201,6 +201,7 @@ public static class ChainWriter
             // opus/topic 这类入口在没有更多线索时会返回空串。空的 TypeLabel 会让下游
             // 审阅表与 CSV 的"类型"列变成空白，所以这里兜一个"其他"，宁可粗也不留空。
             if (Blank(view.TypeLabel)) view.TypeLabel = "其他";
+            else view.TypeLabel = LegacyWorkKind(view.TypeLabel!);
 
             // 棒号来源：声明值优先；小数棒号不采纳；EX 只认显式标记。
             if (!Blank(view.BarRaw) && IsDecimalBar(view.BarRaw))
@@ -282,11 +283,44 @@ public static class ChainWriter
     }
 
     /// <summary>
+    /// 把"平台形态"折进既有 CSV 的类型词表。
+    /// 既有 683 行里「类型」写的是**作品形态**（插画 436 / 文章 78 / 视频 42 / 漫画 / MMD / 音乐…），
+    /// 没有「动态」这个词；链遍历里一大批帖是图片动态，人工归档时一律写「插画」。
+    /// 所以这里把 动态 → 插画，其余（文章/视频）原样保留；更细的类型（音乐/手书/视觉小说…）
+    /// 仍然只能靠 TUI 的 K 键人工改。
+    /// </summary>
+    private static string LegacyWorkKind(string label)
+        => label switch
+        {
+            "动态" => "插画",
+            "图文" => "插画",
+            _ => label,
+        };
+
+    /// <summary>
     /// 认定创作者：优先"链上其他帖子 @ 回来的人"（反指最可信，说明对方认了这棒），
     /// 其次帖子里自己写的 creator_in_text（代发场景），最后才是发布者本人。
     /// </summary>
     private static (string Author, string? Link) ResolveCreator(PostFacts facts, List<PostFacts> all)
     {
+        // 零轮：帖子里自己写明了创作者（代发场景）→ 以它为准。
+        // 为什么放在反指之前：邻居的 @ 通常指向**代发的发布账号**（因为大家看到的就是这个号在发），
+        // 拿它当创作者会把代发者写成作者。实测第 6 棒「5:00 代发：@龙胆紫苑 作者：@Yolandabaka」
+        // 曾被反指判成 龙胆紫苑，而人工 CSV 写的是 Yolandabaka。
+        if (!Blank(facts.CreatorInText))
+        {
+            var creator = facts.CreatorInText!;
+            var uid = 0L;
+            foreach (var m in facts.Mentions)
+            {
+                if (Blank(m.Uid) || !TextNormalizer.SameName(m.Name, creator)) continue;
+                if (long.TryParse(m.Uid!.Trim(), out var parsed) && parsed > 0) { uid = parsed; break; }
+            }
+            // 创作者 uid 拿不到时用发布账号的空间链接兜底（人工归档也是这么写的，
+            // 例如 18:30「阿雯」在话题里没有自己的号，就用代发号的链接）。
+            return (creator, UidLink(uid) ?? UidLink(facts.AuthorUid));
+        }
+
         // 第一轮只认 uid 反指（最强证据），第二轮才按名字（可能有重名，也可能一人多棒）。
         foreach (var byUid in new[] { true, false })
         {
@@ -303,7 +337,6 @@ public static class ChainWriter
             }
         }
 
-        if (!Blank(facts.CreatorInText)) return (facts.CreatorInText!, UidLink(facts.AuthorUid));
         return (facts.AuthorName, UidLink(facts.AuthorUid));
     }
 

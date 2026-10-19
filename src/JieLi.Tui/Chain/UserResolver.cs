@@ -83,13 +83,15 @@ public sealed class ChainUserLocator : IUserLocator
 
     /// <inheritdoc />
     public void PrimeTopic(long? topicId)
-    {
-        if (topicId is null or <= 0) return;
+    {        if (topicId is null or <= 0) return;
         if (_topicIndexId == topicId) return;
         // 换话题就作废旧索引，下次用到时重建（懒加载，避免入口没话题时白拉一次）
         if (_topicIndexId is not null) _topicIndex = null;
         _topicIndexId = topicId;
     }
+
+    /// <inheritdoc />
+    public TopicIndex? EnsureTopic(Action<string>? log, CancellationToken ct) => EnsureTopicIndex(log, ct);
 
     /// <summary>
     /// 确保话题索引就绪（懒加载）。索引建立失败只记日志，调用方自然退回搜索路径。

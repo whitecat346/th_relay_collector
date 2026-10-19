@@ -338,6 +338,13 @@ public interface IUserLocator
     /// 无话题时传 null，实现方应退化为纯搜索路径。
     /// </summary>
     void PrimeTopic(long? topicId);
+
+    /// <summary>
+    /// 取出（没有就建立）话题卡片索引；没有话题或建立失败返回 null。
+    /// 给「遍历收尾时按话题时间表补全链路」用：卡片自带 mid/name/pub_ts/正文首行，
+    /// 一次拉全就能把 @ 链断开处的相邻棒补回来。
+    /// </summary>
+    TopicIndex? EnsureTopic(Action<string>? log, CancellationToken ct);
 }
 
 /// <summary>AI 辅助判定的请求（只发片段，绝不发整页 HTML）。</summary>
