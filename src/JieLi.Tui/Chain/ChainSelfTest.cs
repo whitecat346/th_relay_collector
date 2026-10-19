@@ -66,6 +66,9 @@ public static class ChainSelfTest
         state.Case("S 按届过滤：同一话题被复用四届时，只留含今年的那一届（--year/--date 可选届）", CaseTopicYearFilter);
         state.Case("T 人工棒号（--at-bar）：只作棒号权威，缺口位置仍按时间判定", CaseManualBarOnlyLabel);
         state.Case("U 补录补全（--add-link --into）：已知节点零网络重放，补录帖续走并补掉缺口", CaseAddLinkCompletes);
+        state.Case("V 复查模式（前向）：时间断裂处从前一棒按「下一棒」@ 逐层递推补全", CaseRecheckForward);
+        state.Case("W 复查模式（反向）：前向接不上已知节点时，从后一棒按「上一棒」@ 向前递推", CaseRecheckBackward);
+        state.Case("X 复查模式（放弃）：两向都递推不到时，如实记缺口、不假装补上", CaseRecheckGivesUp);
 
         state.Line($"  遍历器与落盘用例：通过 {state.Passed}，失败 {state.Failed}");
         return new ChainSelfTestResult { Passed = state.Passed, Failed = state.Failed };
@@ -705,6 +708,174 @@ public static class ChainSelfTest
         s.Check("目录名（slug）沿用原链", completed.Slug == first.Slug, $"{first.Slug} → {completed.Slug}");
     }
 
+    /// <summary>
+    /// 复查模式（前向）：旧链只有 1、2、3、6、7、8（4、5 在两处断裂之间），
+    /// 但第 3 棒的「下一棒」@ 指向第 4 棒 —— 复查应当从前一棒按 @ 逐层递推，把 4、5 补回来。
+    /// </summary>
+    private static void CaseRecheckForward(RunState s)
+    {
+        var reader = new FakeReader();
+        var locator = new FakeLocator();
+        var p = BuildEightBarRelay(reader, locator,
+            p3Next: Link("作者D", isPrev: false, uid: "1004", barRaw: "第4棒", declaredTime: "15:00"),
+            p6Prev: Link("作者E", isPrev: true, uid: "1005", barRaw: "第5棒", declaredTime: "16:00"));
+
+        var existing = OldChain("2026_复查前向_09-06", p[0], p[1], p[2], p[5], p[6], p[7]);
+        using var http = new ChainHttp();
+        var walker = new ChainWalker(http, reader, locator) { MaxNodes = 40, RecheckTimeGaps = true };
+        reader.ReadLog.Clear();
+
+        var completed = walker.Complete(existing, Array.Empty<(PostRef Ref, int? ForcedBar)>(), Query(), log: null);
+
+        s.Check("复查前向：6 个旧节点 + 补回第 4、5 棒 = 8 个",
+            completed.Nodes.Count == 8, Ids(completed));
+        s.Check("复查前向：旧链节点不重读（复查只查缺的部分）",
+            !reader.ReadLog.Contains("1001") && !reader.ReadLog.Contains("1006"),
+            string.Join(",", reader.ReadLog));
+        s.Check("复查前向：补回来的两棒标了「复查补全」",
+            completed.Nodes.Count(n => n.Notes.Any(x => x.Contains("复查补全", StringComparison.Ordinal))) == 2,
+            string.Join(" | ", completed.Nodes.Select(n => $"{n.Facts?.PostId}:{n.Notes.Count}")));
+        s.Check("复查前向：时间断裂消除（不再有 time 缺口）",
+            completed.Gaps.All(g => g.Kind != "time"), DescribeGaps(completed));
+        s.Check("复查前向：slug 沿用旧链", completed.Slug == existing.Slug, $"{existing.Slug} → {completed.Slug}");
+    }
+
+    /// <summary>
+    /// 复查模式（反向）：第 3 棒的「下一棒」@ 直接指到了已知的第 6 棒（前向没得可补），
+    /// 这时应当退一步，从第 6 棒的「上一棒」@ 往前递推，补回 5、4。
+    /// </summary>
+    private static void CaseRecheckBackward(RunState s)
+    {
+        var reader = new FakeReader();
+        var locator = new FakeLocator();
+        var p = BuildEightBarRelay(reader, locator,
+            p3Next: Link("作者F", isPrev: false, uid: "1006", barRaw: "第6棒", declaredTime: "17:00"),
+            p6Prev: Link("作者E", isPrev: true, uid: "1005", barRaw: "第5棒", declaredTime: "16:00"));
+
+        var existing = OldChain("2026_复查反向_09-06", p[0], p[1], p[2], p[5], p[6], p[7]);
+        using var http = new ChainHttp();
+        var walker = new ChainWalker(http, reader, locator) { MaxNodes = 40, RecheckTimeGaps = true };
+        reader.ReadLog.Clear();
+
+        var completed = walker.Complete(existing, Array.Empty<(PostRef Ref, int? ForcedBar)>(), Query(), log: null);
+
+        s.Check("复查反向：补回第 4、5 棒后共 8 个节点",
+            completed.Nodes.Count == 8, Ids(completed));
+        s.Check("复查反向：确实读到了第 5、4 棒（说明是从后一棒往前递推的）",
+            reader.ReadLog.Contains("1005") && reader.ReadLog.Contains("1004"),
+            string.Join(",", reader.ReadLog));
+        s.Check("复查反向：时间断裂消除",
+            completed.Gaps.All(g => g.Kind != "time"), DescribeGaps(completed));
+    }
+
+    /// <summary>
+    /// 复查模式（放弃）：第 3 棒的「下一棒」@ 查不到人（名字解析失败），
+    /// 第 6 棒又没有写「上一棒」—— 两个方向都递推不到，应当如实记缺口，不假装补上。
+    /// </summary>
+    private static void CaseRecheckGivesUp(RunState s)
+    {
+        var reader = new FakeReader();
+        var locator = new FakeLocator();
+        var p = BuildEightBarRelay(reader, locator,
+            p3Next: Link("作者Z", isPrev: false, uid: "2099"), // 故意不注册这个用户
+            p6Prev: null);                                     // 第 6 棒也没写「上一棒」
+
+        var existing = OldChain("2026_复查放弃_09-06", p[0], p[1], p[2], p[5], p[6], p[7]);
+        using var http = new ChainHttp();
+        var walker = new ChainWalker(http, reader, locator) { MaxNodes = 40, RecheckTimeGaps = true };
+
+        var completed = walker.Complete(existing, Array.Empty<(PostRef Ref, int? ForcedBar)>(), Query(), log: null);
+
+        s.Check("复查放弃：没有凭空补出节点（仍是 6 个）",
+            completed.Nodes.Count == 6, Ids(completed));
+        s.Check("复查放弃：缺口清单里留下 time 缺口",
+            completed.Gaps.Any(g => g.Kind == "time"), DescribeGaps(completed));
+        s.Check("复查放弃：警告里说明自动补全失败",
+            completed.Warnings.Any(x => x.Contains("自动补全失败", StringComparison.Ordinal)),
+            string.Join(" | ", completed.Warnings));
+    }
+
+    /// <summary>
+    /// 造一条 8 棒的「完整」接力（12:00 起整点递推），只按需要改写某一棒的下一棒/上一棒，
+    /// 用来构造「链条上缺了一段」的情形。返回 p1..p8。
+    /// </summary>
+    private static PostFacts[] BuildEightBarRelay(FakeReader reader, FakeLocator locator, NeighborLink? p3Next, NeighborLink? p6Prev)
+    {
+        var names = new[] { "作者A", "作者B", "作者C", "作者D", "作者E", "作者F", "作者G", "作者H" };
+        var uids = new long[] { 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008 };
+        var posts = new PostFacts[8];
+        for (var i = 0; i < 8; i++)
+        {
+            var hour = 12 + i;
+            posts[i] = Facts("100" + (i + 1).ToString(CultureInfo.InvariantCulture), names[i], uids[i],
+                BaseDay.AddHours(hour), bar: i + 1,
+                declared: hour.ToString("00", CultureInfo.InvariantCulture) + ":00",
+                first: i == 0, last: i == 7);
+        }
+
+        // 互相指认：第 i 棒写了下一棒（i+1）与上一棒（i-1）
+        for (var i = 0; i < 8; i++)
+        {
+            if (i > 0)
+            {
+                posts[i].Prevs.Add(Link(names[i - 1], isPrev: true, uid: uids[i - 1].ToString(CultureInfo.InvariantCulture),
+                    barRaw: "第" + i + "棒", declaredTime: (11 + i).ToString("00", CultureInfo.InvariantCulture) + ":00"));
+            }
+            if (i < 7)
+            {
+                posts[i].Nexts.Add(Link(names[i + 1], isPrev: false, uid: uids[i + 1].ToString(CultureInfo.InvariantCulture),
+                    barRaw: "第" + (i + 2) + "棒", declaredTime: (13 + i).ToString("00", CultureInfo.InvariantCulture) + ":00"));
+            }
+        }
+
+        if (p3Next is not null)
+        {
+            posts[2].Nexts.Clear();
+            posts[2].Nexts.Add(p3Next);
+        }
+        if (p6Prev is null && posts[5].Prevs.Count > 0)
+        {
+            posts[5].Prevs.Clear();
+        }
+        else if (p6Prev is not null)
+        {
+            posts[5].Prevs.Clear();
+            posts[5].Prevs.Add(p6Prev);
+        }
+
+        foreach (var post in posts) Register(reader, locator, post);
+        return posts;
+    }
+
+    /// <summary>手工造一条「旧链」结果（就像从 chain.json 读回来那样）：第一个节点是入口节点。</summary>
+    private static ChainResult OldChain(string slug, params PostFacts[] facts)
+    {
+        var result = new ChainResult
+        {
+            StartPostId = facts[0].PostId,
+            RelayName = facts[0].RelayName,
+            Slug = slug,
+        };
+        for (var i = 0; i < facts.Length; i++)
+        {
+            result.Nodes.Add(new ChainNode
+            {
+                Ref = PostRef.Opus(facts[i].PostId),
+                Facts = facts[i],
+                Direction = i == 0 ? WalkDirection.Both : WalkDirection.Forward,
+                Source = i == 0 ? FetchMethod.StartLink : FetchMethod.Unknown,
+                Depth = i,
+                Confidence = i == 0 ? 1.0 : 0.9,
+                IsStart = i == 0,
+                MatchedBy = i == 0 ? "入口帖" : "旧链节点（复查测试）",
+            });
+        }
+        return result;
+    }
+
+    private static string Ids(ChainResult result)
+        => string.Join(",", result.Nodes.Select(n => n.Facts?.PostId ?? n.Ref.Id));
+
     /// <summary>造一条 ParsedBar：CardId、发布者、本地发布时刻（可选声明时段）。</summary>
     private static ParsedBar Bar(string id, string poster, DateTime local, string? declared = null) => new()
     {
@@ -802,11 +973,17 @@ public static class ChainSelfTest
     }
 
     private static ChainResult Walk(FakeReader reader, FakeLocator locator, PostRef start, RelayQuery query,
-        IReadOnlyList<(PostRef Ref, int? ForcedBar)>? supplements = null)
+        IReadOnlyList<(PostRef Ref, int? ForcedBar)>? supplements = null, bool recheck = false)
     {
         // ChainHttp 只构造不发请求：验收/遍历都由假 reader/locator 驱动，断网也能跑。
+        // recheck 默认关：复查模式会按时间自动补棒，只有专门测它的用例才打开。
         using var http = new ChainHttp();
-        var walker = new ChainWalker(http, reader, locator) { MaxNodes = 40, MaxConsecutiveFailures = 2 };
+        var walker = new ChainWalker(http, reader, locator)
+        {
+            MaxNodes = 40,
+            MaxConsecutiveFailures = 2,
+            RecheckTimeGaps = recheck,
+        };
         return walker.Walk(start, query, supplements, log: null);
     }
 

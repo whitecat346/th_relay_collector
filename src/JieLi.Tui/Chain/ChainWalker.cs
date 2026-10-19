@@ -171,6 +171,11 @@ public sealed partial class ChainWalker
         CompleteFromTopic(ctx);
 
         InferChainBars(ctx);
+
+        // 复查模式：全部做完后再按「时间」检查一遍链条是否连续；断了就进补全模式
+        // （先站在缺口前一棒按「下一棒」递推，没有 @ 对象再从后一棒往前递推，补不到就放弃并记账）。
+        RecheckTimeContinuity(ctx);
+
         FinishResult(ctx);
         PruneCoveredGaps(ctx);
         return result;
@@ -276,6 +281,7 @@ public sealed partial class ChainWalker
         }
 
         InferChainBars(ctx);
+        RecheckTimeContinuity(ctx); // 补录后的旧链同样要复查时间连续性（--no-recheck 可关）
         FinishResult(ctx);
         PruneCoveredGaps(ctx);
         if (!string.IsNullOrWhiteSpace(existing.Slug)) result.Slug = existing.Slug; // 目录名保持不变
@@ -604,6 +610,8 @@ public sealed partial class ChainWalker
         if (links.Count == 0)
         {
             // 没有 @ 指认：可能只是漏标。记一个可执行的缺口，并计一次失败（连续失败会停方向）。
+            // 复查模式补全时这些是「补到这里就断了」的正常情况，不写缺口、不动方向状态。
+            if (_inRecheck) return;
             ctx.Result.Gaps.Add(BuildLinkGap(facts, dir, linkLabel));
             RegisterFailure(ctx, dir, $"没有「{linkLabel}」@：postId={facts.PostId}");
             return;
@@ -614,6 +622,7 @@ public sealed partial class ChainWalker
             if (state.Stopped) return;
             if (ctx.Result.Nodes.Count >= MaxNodes)
             {
+                if (_inRecheck) return; // 复查补全不触发全局上限停车（外面另有 MaxRecheckRepairs 限流）
                 StopBoth(ctx, $"已达 MaxNodes={MaxNodes} 上限，停止遍历（缺口见清单）", warn: true);
                 return;
             }
@@ -636,10 +645,12 @@ public sealed partial class ChainWalker
                     break;
 
                 case NeighborStatus.StopDirection:
+                    if (_inRecheck) { state.Stopped = true; return; } // 复查补全：只停本次递推，不改全局方向状态
                     StopDirection(ctx, dir, resolution.Message, warn: true);
                     return;
 
                 case NeighborStatus.Meeting:
+                    if (_inRecheck) { state.Stopped = true; return; } // 复查补全：接上已知节点即止，不写「两向相遇」
                     if (resolution.Existing is { } existing && !Covers(existing.Direction, dir))
                         existing.Notes.Add("两向都指向本节点（先到者胜，保留先到方向；方向矛盾见报告）");
                     ctx.Result.Warnings.Add(resolution.Message);
@@ -647,6 +658,7 @@ public sealed partial class ChainWalker
                     return;
 
                 default:
+                    if (_inRecheck) return; // 复查补全：这一次找不到就交给上一层决定要不要换方向
                     RegisterFailure(ctx, dir, resolution.Message);
                     if (state.Stopped) return;
                     break;

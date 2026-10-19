@@ -14,6 +14,12 @@ namespace JieLi.Tui;
 
 public static class Program
 {
+    // 复查模式（遍历/补录全部完成后再按时间查一遍链条）的全局配置：
+    // 由命令行 --no-recheck / --recheck-gaps / --recheck-repairs 写入，链遍历两种入口共用。
+    private static bool _recheckEnabled = true;
+    private static int _recheckGaps = 12;
+    private static int _recheckRepairs = 24;
+
     public static int Main(string[] args)
     {
         try { Console.OutputEncoding = new UTF8Encoding(false); } catch { /* 重定向时可能不支持 */ }
@@ -99,6 +105,18 @@ public static class Program
                     break;
                 case "--no-details":
                     fetchDetails = false;
+                    break;
+                case "--no-recheck":
+                    _recheckEnabled = false;
+                    break;
+                case "--recheck":
+                    _recheckEnabled = true;
+                    break;
+                case "--recheck-gaps":
+                    if (i + 1 < args.Length && int.TryParse(args[++i], out var rg) && rg > 0) _recheckGaps = rg;
+                    break;
+                case "--recheck-repairs":
+                    if (i + 1 < args.Length && int.TryParse(args[++i], out var rr) && rr > 0) _recheckRepairs = rr;
                     break;
                 case "--backfill":
                     backfill = true;
@@ -524,7 +542,14 @@ public static class Program
         cache.Load(log);
         var reader = new Chain.ChainPostReader(http);
         var locator = new Chain.ChainUserLocator(http, new Chain.ChainSearchClient(http), cache);
-        var walker = new Chain.ChainWalker(http, reader, locator) { MaxNodes = 80, MaxConsecutiveFailures = 2 };
+        var walker = new Chain.ChainWalker(http, reader, locator)
+        {
+            MaxNodes = 80,
+            MaxConsecutiveFailures = 2,
+            RecheckTimeGaps = _recheckEnabled,
+            MaxRecheckGaps = _recheckGaps,
+            MaxRecheckRepairs = _recheckRepairs,
+        };
 
         Chain.ChainResult completed;
         try
@@ -1305,7 +1330,14 @@ public static class Program
         if (http.UsingLoginCookie) Log("本次使用了登录态（cookie.txt）。");
         Log("");
 
-        var walker = new Chain.ChainWalker(http, reader, locator, ai) { MaxNodes = 80, MaxConsecutiveFailures = 2 };
+        var walker = new Chain.ChainWalker(http, reader, locator, ai)
+        {
+            MaxNodes = 80,
+            MaxConsecutiveFailures = 2,
+            RecheckTimeGaps = _recheckEnabled,
+            MaxRecheckGaps = _recheckGaps,
+            MaxRecheckRepairs = _recheckRepairs,
+        };
         Chain.ChainResult result;
         try
         {
@@ -1596,6 +1628,11 @@ public static class Program
         Console.WriteLine("  --hours <N>                            活动声明时长（24h/32h…），用于放宽搜索区间");
         Console.WriteLine("  --as <活动目录名>                      覆盖自动命名（默认 {年份}_{活动名}_{月-日}）");
         Console.WriteLine("  --ai / --ai-yes / --ai-budget <N>      启用 AI 兜底判定（默认关闭、逐次确认、默认预算 20）");
+        Console.WriteLine("  复查模式（默认开）: 走完后按时间复查链条；相邻棒之间空出整段时自动补全 ——");
+        Console.WriteLine("    先从前一棒的「下一棒」@ 逐层往后递推，前一棒没写 @ 就改从后一棒往前递推，补不到就如实记缺口。");
+        Console.WriteLine("  --no-recheck                           关掉复查模式（只走 @ 链，不按时间补断裂）");
+        Console.WriteLine("  --recheck-gaps <N>                     最多处理几处时间断裂（默认 12）");
+        Console.WriteLine("  --recheck-repairs <N>                  复查模式单次最多补入几棒（默认 24）");
         Console.WriteLine("  产出 work/<slug>/{chain.json,review.jsonl,report.md}，再用 --review / --render 接手");
         Console.WriteLine();
         Console.WriteLine("开发期探针（不产出文件）:");

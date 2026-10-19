@@ -216,6 +216,9 @@ public sealed partial class ChainWalker
                     owner.MatchedBy = "话题卡片·同一棒的另一稿（改用带正文的那张）";
                     owner.Notes.Add($"同一棒有多个帖子，改用有正文的那张（原为 {oldKind} 的空帖）");
                     owner.Notes.Add(CompletionNote);
+                    // 换了帖子，Visited 的钥匙跟着换：旧 postId 不该再指向这一棒（否则旧链上会再收一次）。
+                    UnregisterVisited(ctx, owner);
+                    RegisterVisited(ctx, owner, reference, facts);
                     inserted++;
                     continue;
                 }
@@ -693,6 +696,9 @@ public sealed partial class ChainWalker
         if (card.AuthorUid > 0 && facts.AuthorUid <= 0) facts.AuthorUid = card.AuthorUid;
 
         ctx.Result.Nodes.Add(node);
+        // 话题补入的节点也必须登记进 Visited：否则后续的续走/复查会把同一帖再当新节点收一遍
+        // （实测：复查模式补 11 棒，全是话题补全已收过的帖，节点数 37→48、出现 11 条重复）。
+        RegisterVisited(ctx, node, reference, facts);
         ctx.ReadCache[reference.Id] = facts;
         if (!string.IsNullOrWhiteSpace(facts.PostId)) ctx.ReadCache[facts.PostId] = facts;
         ctx.Result.Audit.Add(new ChainAuditEntry
@@ -704,6 +710,23 @@ public sealed partial class ChainWalker
                      + (string.IsNullOrWhiteSpace(facts.Title) ? "" : $" 标题：{Trim(facts.Title, 40)}"),
             Success = true,
         });
+    }
+
+    /// <summary>把话题补入的节点登记进 Visited（postId 与链接 id 两把钥匙都登记）。</summary>
+    private static void RegisterVisited(WalkContext ctx, ChainNode node, PostRef reference, PostFacts facts)
+    {
+        foreach (var key in new[] { reference.Id, facts.PostId })
+        {
+            if (string.IsNullOrWhiteSpace(key)) continue;
+            ctx.Visited[key.Trim()] = node;
+        }
+    }
+
+    /// <summary>取消登记某个节点名下的所有 Visited 钥匙（同一棒换帖子时用）。</summary>
+    private static void UnregisterVisited(WalkContext ctx, ChainNode node)
+    {
+        foreach (var key in ctx.Visited.Where(kv => ReferenceEquals(kv.Value, node)).Select(kv => kv.Key).ToList())
+            ctx.Visited.Remove(key);
     }
 
     private static string ShortName(TopicCardEntry card)
