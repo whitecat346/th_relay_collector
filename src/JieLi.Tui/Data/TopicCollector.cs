@@ -23,6 +23,14 @@ public sealed class CollectManifest
     /// <summary>逐帖详情补全：成功 / 失败条数（posts.jsonl）。</summary>
     public int DetailsFetched { get; set; }
     public int DetailsFailed { get; set; }
+    /// <summary>按届过滤：选中那一届的年份（0 = 未过滤）。</summary>
+    public int EditionYear { get; set; }
+    /// <summary>过滤后参与解析的卡片数。</summary>
+    public int CardsInEdition { get; set; }
+    /// <summary>被「按届过滤」排除的卡片数。</summary>
+    public int CardsDroppedByEdition { get; set; }
+    /// <summary>按届过滤的人读说明。</summary>
+    public string EditionNote { get; set; } = string.Empty;
     public string CollectedAt { get; set; } = string.Empty;
     public List<string> Warnings { get; set; } = new();
 }
@@ -49,7 +57,10 @@ public sealed class TopicCollector
         long topicId,
         string workRoot,
         Action<string>? log = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int? yearFilter = null,
+        DateTime? dateFilter = null,
+        bool allYears = false)
     {
         var subject = await _client.GetSubjectAsync(topicId, ct);
         log?.Invoke($"话题：{subject.Name}  (id={subject.TopicId})");
@@ -57,6 +68,33 @@ public sealed class TopicCollector
 
         var collected = await _client.CollectAllAsync(topicId, m => log?.Invoke("  " + m), ct);
         var cards = collected.Cards;
+        // 归一化（只做文本提取，建立 id → 卡片 的对照；按届过滤用的是它的发布时间）
+        var topics = cards.Select(CardTextExtractor.Extract).ToList();
+
+        // ---- 按届过滤：同一个话题常被这场年度接力反复复用，整锅端会把不同年份混成一条链 ----
+        YearSelection? selection = null;
+        if (!allYears)
+        {
+            selection = TopicYearFilter.Select(topics, yearFilter, dateFilter);
+            if (selection.Filtered)
+            {
+                log?.Invoke(selection.Note);
+                log?.Invoke("  （要看别的年份：--year 2024 或 --date 2024-09-17；确认不要过滤：--all-years）");
+            }
+            else
+            {
+                log?.Invoke("按届过滤：全部卡片都属于同一届，未排除任何卡片");
+            }
+        }
+        else if (cards.Count > 0)
+        {
+            log?.Invoke("--all-years：不做按届过滤（话题里所有年份的卡片都会参与解析）");
+        }
+
+        var keptIds = selection?.Kept.Select(t => t.Id).ToHashSet(StringComparer.Ordinal) ?? null;
+        var droppedIds = selection?.Dropped.Select(t => t.Id).ToHashSet(StringComparer.Ordinal) ?? new HashSet<string>(StringComparer.Ordinal);
+        var kept = keptIds is null ? cards : cards.Where(c => c.IdStr is not null && keptIds.Contains(c.IdStr)).ToList();
+        var dropped = cards.Where(c => c.IdStr is not null && droppedIds.Contains(c.IdStr)).ToList();
 
         var dir = Path.Combine(workRoot, subject.TopicId.ToString());
         Directory.CreateDirectory(dir);
@@ -64,21 +102,28 @@ public sealed class TopicCollector
         var topPath = Path.Combine(dir, "top.json");
         var rawPath = Path.Combine(dir, "cards.raw.jsonl");
         var normPath = Path.Combine(dir, "cards.jsonl");
+        var droppedPath = Path.Combine(dir, "cards.dropped.jsonl");
         var manifestPath = Path.Combine(dir, "subject.json");
 
         // 话题身份原文
         if (_client.LastTopRawJson is { Length: > 0 } topRaw)
             await File.WriteAllTextAsync(topPath, topRaw, new UTF8Encoding(false), ct);
 
-        // 原始卡片（未改动）
+        // 原始卡片（未改动）：只留选中那一届；被排除的另存 cards.dropped.jsonl 供审计
         await using (var w = new StreamWriter(rawPath, false, new UTF8Encoding(false)))
         {
-            foreach (var c in cards)
+            foreach (var c in kept)
+                await w.WriteLineAsync(JsonSerializer.Serialize(c, JsonlOut));
+        }
+        if (dropped.Count > 0)
+        {
+            await using var w = new StreamWriter(droppedPath, false, new UTF8Encoding(false));
+            foreach (var c in dropped)
                 await w.WriteLineAsync(JsonSerializer.Serialize(c, JsonlOut));
         }
 
         // 归一化卡片
-        var normalized = cards.Select(CardTextExtractor.Extract).ToList();
+        var normalized = kept.Select(CardTextExtractor.Extract).ToList();
         await using (var w = new StreamWriter(normPath, false, new UTF8Encoding(false)))
         {
             foreach (var tc in normalized)
@@ -111,6 +156,10 @@ public sealed class TopicCollector
             Pages = collected.Pages,
             EntriesWithText = normalized.Count(c => c.TextSources.Count > 0),
             EntriesWithoutText = normalized.Count(c => c.TextSources.Count == 0),
+            EditionYear = selection?.Year ?? 0,
+            CardsInEdition = kept.Count,
+            CardsDroppedByEdition = dropped.Count,
+            EditionNote = selection?.Note ?? (allYears ? "--all-years：未做按届过滤" : string.Empty),
             CollectedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
         };
 
@@ -122,12 +171,14 @@ public sealed class TopicCollector
 
         if (manifest.EntriesWithoutText > 0)
             manifest.Warnings.Add($"有 {manifest.EntriesWithoutText} 条卡片完全取不到正文（需人工保存页面兜底）");
-        log?.Invoke($"正文覆盖：{manifest.EntriesWithText}/{cards.Count} 条卡片取到文本");
+        if (dropped.Count > 0)
+            manifest.Warnings.Add(selection?.Note ?? $"按届过滤排除了 {dropped.Count} 条卡片");
+        log?.Invoke($"正文覆盖：{manifest.EntriesWithText}/{kept.Count} 条卡片取到文本");
 
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest, PrettyOut), new UTF8Encoding(false), ct);
 
         log?.Invoke($"已写入 {dir}");
-        foreach (var f in new[] { "top.json", "cards.raw.jsonl", "cards.jsonl", "subject.json" })
+        foreach (var f in new[] { "top.json", "cards.raw.jsonl", "cards.jsonl", "cards.dropped.jsonl", "subject.json" })
         {
             var p = Path.Combine(dir, f);
             log?.Invoke(File.Exists(p) ? $"  · {f}  ({new FileInfo(p).Length:N0} 字节)" : $"  · {f}  (未生成)");

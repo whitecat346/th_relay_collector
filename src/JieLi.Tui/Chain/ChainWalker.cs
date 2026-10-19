@@ -177,6 +177,169 @@ public sealed partial class ChainWalker
     }
 
     /// <summary>
+    /// 在**已有的链结果**上补录一棒，并从它继续双向补全（`--add-link URL --into &lt;slug&gt;`）。
+    ///
+    /// 与 <see cref="Walk"/> 的区别：旧链上的节点全部当作已知事实直接种进上下文（**不联网重读**），
+    /// 只有补录帖是新的落点；两个方向各走到碰到已知节点（相遇）为止，再用
+    /// <see cref="CompleteFromTopic"/> 把「没写上一棒」的断点按话题时间表补上。
+    ///
+    /// `forcedBar`（`--at-bar`）只改棒号标签，不参与缺口位置判定 —— 缺口一律按时间算。
+    /// </summary>
+    public ChainResult Complete(
+        ChainResult existing,
+        IReadOnlyList<(PostRef Ref, int? ForcedBar)> supplements,
+        RelayQuery query,
+        Action<string>? log,
+        CancellationToken ct = default)
+    {
+        var result = new ChainResult { StartPostId = existing.StartPostId };
+        var ctx = new WalkContext(result, query) { Log = log, Ct = ct };
+
+        // ---- 1. 旧链节点全部当已知事实种进来（零请求）----
+        ChainNode? startNode = null;
+        foreach (var old in existing.Nodes.Where(n => n.Facts is not null).OrderBy(n => n.Depth))
+        {
+            var facts = old.Facts!;
+            var node = new ChainNode
+            {
+                Ref = old.Ref,
+                Direction = old.Direction,
+                Source = old.Source,
+                Depth = old.Depth,
+                Confidence = old.Confidence,
+                IsStart = old.IsStart,
+                IsSupplement = old.IsSupplement,
+                MatchedBy = old.MatchedBy,
+            };
+            node.Notes.AddRange(old.Notes);
+            if (AddNode(ctx, node, facts) is { } added)
+            {
+                ctx.ReadCache[KeyOf(facts, old.Ref)] = facts;
+                if (added.IsStart) startNode = added;
+            }
+        }
+
+        // ---- 2. 活动名 / 日期窗口 / 话题：沿用旧链，缺的才补 ----
+        var startFacts = startNode?.Facts;
+        if (startFacts is not null) ResolveQueryWindow(query, startFacts);
+        if (string.IsNullOrWhiteSpace(query.RelayName))
+            query.RelayName = startFacts?.RelayName ?? existing.RelayName;
+        if (string.IsNullOrWhiteSpace(query.RelayName)) query.RelayName = existing.RelayName;
+        result.RelayName = query.RelayName ?? existing.RelayName;
+        if (query.TopicId is null && (startFacts?.TopicId ?? FirstTopicId(existing)) is { } topicId)
+            query.TopicId = topicId;
+        _locator.PrimeTopic(query.TopicId);
+
+        // 旧缺口当底稿留着，补完由 PruneCoveredGaps 去掉已经被补上的
+        foreach (var gap in existing.Gaps) result.Gaps.Add(gap);
+
+        // 旧链上的节点本来就是「保留」的：后面剔除窗口外新节点时不能误伤
+        var knownIds = ctx.Visited.Keys.ToHashSet(StringComparer.Ordinal);
+
+        // ---- 3. 补录帖作为新落点，从它双向展开 ----
+        var seeds = new List<ChainNode>();
+        foreach (var (suppRef, forcedBar) in supplements)
+        {
+            var node = ReadSupplement(ctx, suppRef, forcedBar);
+            if (node is not null) seeds.Add(node);
+        }
+
+        if (seeds.Count == 0)
+        {
+            log?.Invoke("补录链接没有带来新节点（读不出来，或它本来就在链上）；仍按原链重算缺口");
+        }
+        else
+        {
+            foreach (var seed in seeds) ctx.Queue.Enqueue(new Expansion(seed, WalkDirection.Both));
+            while (ctx.Queue.Count > 0)
+            {
+                if (ctx.Forward.Stopped && ctx.Backward.Stopped) break;
+                ct.ThrowIfCancellationRequested();
+                if (result.Nodes.Count >= MaxNodes)
+                {
+                    StopBoth(ctx, $"已达 MaxNodes={MaxNodes} 上限，停止遍历（缺口见清单）", warn: true);
+                    break;
+                }
+
+                var expansion = ctx.Queue.Dequeue();
+                var node = expansion.Node;
+                if (node.Facts is null) continue;
+                if (Covers(expansion.Directions, WalkDirection.Forward) && !ctx.Forward.Stopped)
+                    ExpandOne(ctx, node, WalkDirection.Forward);
+                if (Covers(expansion.Directions, WalkDirection.Backward) && !ctx.Backward.Stopped)
+                    ExpandOne(ctx, node, WalkDirection.Backward);
+            }
+
+            // 补录点往往只接上两个方向中的一边，另一侧仍断：再用话题时间表兜一次
+            DropOutOfWindow(ctx, knownIds, seeds);
+            CompleteFromTopic(ctx);
+        }
+
+        InferChainBars(ctx);
+        FinishResult(ctx);
+        PruneCoveredGaps(ctx);
+        if (!string.IsNullOrWhiteSpace(existing.Slug)) result.Slug = existing.Slug; // 目录名保持不变
+        return result;
+    }
+
+    private static long? FirstTopicId(ChainResult result)
+    {
+        foreach (var n in result.Nodes)
+            if (n.Facts?.TopicId is > 0 and var t) return t;
+        return null;
+    }
+
+    /// <summary>
+    /// 补录展开的边界：如果补录链接指到了**别的接力**，顺着 @ 会走进另一场活动。
+    /// 这里把「不在本场时间窗内」的新节点剔掉（旧链节点与补录帖本身保留），只留一条警告。
+    /// 判据是发布时间：活动日 [-2h, DayEnd+6h]，与候选验收用的是同一个窗口。
+    /// </summary>
+    private static void DropOutOfWindow(WalkContext ctx, HashSet<string> knownIds, IReadOnlyList<ChainNode> seeds)
+    {
+        var start = ctx.Query.DayStart;
+        if (start == DateTime.MinValue) return;
+        var lo = start.AddHours(-2);
+        var hi = (ctx.Query.DayEnd == DateTime.MinValue ? start.AddHours(24) : ctx.Query.DayEnd).AddHours(6);
+
+        var seedIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var seed in seeds)
+        {
+            if (seed.Facts is null) continue;
+            seedIds.Add(KeyOf(seed.Facts, seed.Ref));
+            var pub = seed.Facts.PubLocal;
+            if (pub != DateTime.MinValue && (pub < lo || pub > hi))
+                ctx.Result.Warnings.Add(
+                    $"补录帖「{seed.Facts.AuthorName}」发布于 {pub:MM-dd HH:mm}，不在本场活动时间窗（{lo:MM-dd HH:mm}～{hi:MM-dd HH:mm}）内 —— 请确认它确实是这一场接力的棒次。");
+        }
+
+        var dropped = new List<string>();
+        for (var i = ctx.Result.Nodes.Count - 1; i >= 0; i--)
+        {
+            var node = ctx.Result.Nodes[i];
+            if (node.Facts is null) continue;
+            var key = KeyOf(node.Facts, node.Ref);
+            if (knownIds.Contains(key) || seedIds.Contains(key)) continue;
+            var local = node.Facts.PubLocal;
+            if (local >= lo && local <= hi) continue;
+            dropped.Add($"{node.Facts.AuthorName}（{local:MM-dd HH:mm}）");
+            ctx.Result.Nodes.RemoveAt(i);
+            ctx.Visited.Remove(key);
+        }
+
+        if (dropped.Count > 0)
+        {
+            // 被剔掉的节点带出来的缺口一并清掉，否则报告里会留下无主的「候选全被拒收」
+            var orphanGaps = ctx.Result.Gaps.RemoveAll(g =>
+                !string.IsNullOrEmpty(g.FromPostId) && !ctx.Visited.ContainsKey(g.FromPostId));
+            ctx.Result.Warnings.Add(
+                $"补录展开带进了 {dropped.Count} 条不在本场活动时间窗内的帖子（多半是补录链接指到了别的接力），已剔除："
+                + string.Join("、", dropped)
+                + (orphanGaps > 0 ? $"；同时清掉 {orphanGaps} 处由它们产生的缺口" : ""));
+        }
+    }
+
+
+    /// <summary>
     /// 去掉「其实已经拿到」的假缺口：某条缺口期望的人/棒，链上已经有节点覆盖它。
     /// 判据要**同时**对上人和棒位（或双方都推不出棒位），否则会把「一人多棒」里
     /// 真正还缺的那一棒也删掉。
@@ -885,6 +1048,10 @@ public sealed partial class ChainWalker
     /// 棒号后处理：声明值优先，其次从相邻棒指认 / 发布时间推算（报告会标「推算」）。
     /// 推算只是为了让「按棒号排序」和人工核对有个参照，绝不覆盖声明值。
     /// </summary>
+    /// <summary>棒号是否由人工指定（`--at-bar`）：人工号是权威标签，不能拿去推相邻棒的号。</summary>
+    private static bool HasManualBar(ChainNode node)
+        => node.Notes.Any(n => n.StartsWith(BarManualNote, StringComparison.Ordinal));
+
     private static void InferChainBars(WalkContext ctx)
     {
         var nodes = ctx.Result.Nodes.Where(n => n.Facts is not null).ToList();
@@ -899,6 +1066,7 @@ public sealed partial class ChainWalker
                 var target = FindChainNodeByLink(nodes, link, node);
                 if (target?.Facts is null || ReferenceEquals(target, node)) continue;
                 if (target.Facts.BarNumber is not null || target.Facts.IsEx) continue;
+                if (HasManualBar(target)) continue;
                 var bar = MatchVerifier.ParseBar(link.BarRaw);
                 if (bar is null) continue;
                 target.Facts.BarNumber = bar;
@@ -910,6 +1078,7 @@ public sealed partial class ChainWalker
 
         // ② 发布时间相邻（≤3h）且一侧有棒号 → 另一侧 ±1。
         //    不按 uid 合并节点（一人多棒合法），只按时间相邻推数字。
+        //    人工指定的棒号不参与推算（否则会把人工号传播成一大片推算号）。
         var byTime = nodes.OrderBy(n => n.Facts!.PubTs).ToList();
         for (var i = 0; i + 1 < byTime.Count; i++)
         {
@@ -919,6 +1088,7 @@ public sealed partial class ChainWalker
             var fb = b.Facts!;
             if (fa.PubTs <= 0 || fb.PubTs <= 0) continue;
             if (fb.PubTs - fa.PubTs > 3 * 3600) continue;
+            if (HasManualBar(a) || HasManualBar(b)) continue;
 
             if (fa.BarNumber is { } ab && fb.BarNumber is null && !fb.IsEx)
             {

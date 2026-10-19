@@ -29,3 +29,6 @@ cookie.txt
 .idea/
 Thumbs.db
 desktop.ini
+
+# 开发期探针目录（临时采集/日志，不入库）
+_probe_tmp/

@@ -57,7 +57,8 @@ public static class ArtifactValidator
     /// </summary>
     private const int OrganizerThreshold = 2;
 
-    public static ValidationResult Validate(IEnumerable<TopicCard> cards, int? dynamicsReported = null, string? topicName = null)
+    public static ValidationResult Validate(IEnumerable<TopicCard> cards, int? dynamicsReported = null, string? topicName = null,
+        IReadOnlyDictionary<string, int>? manualBars = null)
     {
         var cardList = cards.ToList();
 
@@ -87,7 +88,8 @@ public static class ArtifactValidator
             bars.Add(bar);
         }
 
-        return FinishValidation(bars, cardList, dynamicsReported, tag, SummaryExtractor.FindRoster(cardList));
+        return FinishValidation(bars, cardList, dynamicsReported, tag, SummaryExtractor.FindRoster(cardList),
+                                manualBars: manualBars);
     }
 
     /// <summary>
@@ -99,7 +101,8 @@ public static class ArtifactValidator
     /// **只检查已知棒位之间的空隙**（首尾之外不算缺）。
     /// </summary>
     public static ValidationResult ValidateFromBars(
-        List<ParsedBar> bars, int? dynamicsReported = null, string? topicTag = null)
+        List<ParsedBar> bars, int? dynamicsReported = null, string? topicTag = null,
+        IReadOnlyDictionary<string, int>? manualBars = null)
     {
         // 名册发现需要 TopicCard 视图；用 ParsedBar 携带的 MergedText 还原即可
         var pseudo = bars.Select(b => new TopicCard
@@ -111,8 +114,12 @@ public static class ArtifactValidator
 
         return FinishValidation(bars, pseudo, dynamicsReported, topicTag,
                                 SummaryExtractor.FindRoster(pseudo),
-                                missingBarsOnlyWithinKnownRange: true);
+                                missingBarsOnlyWithinKnownRange: true,
+                                manualBars: manualBars);
     }
+
+    /// <summary>「棒号由人工指定」必须作为 Notes 前缀（TUI/报告靠它标「人工指定」）。</summary>
+    public const string BarManualNote = "棒号由人工指定";
 
     /// <summary>两种输入模式共用的第二遍处理与三道断言。</summary>
     private static ValidationResult FinishValidation(
@@ -121,7 +128,8 @@ public static class ArtifactValidator
         int? dynamicsReported,
         string? tag,
         (TopicCard? Card, List<RosterSlot> Slots) roster,
-        bool missingBarsOnlyWithinKnownRange = false)
+        bool missingBarsOnlyWithinKnownRange = false,
+        IReadOnlyDictionary<string, int>? manualBars = null)
     {
         var result = new ValidationResult();
         result.Bars.AddRange(bars);
@@ -137,19 +145,42 @@ public static class ArtifactValidator
         // 仍无棒号时：退回"时段反演"（只对有时段的卡片有效）
         AssignBarNumbersByTime(bars, rosterSlots, result, tag);
 
+        // ---------- 人工棒号（--at-bar）：以用户为准，但不参与缺口位置判定 ----------
+        var manualBarsApplied = ApplyManualBars(bars, manualBars, result);
+
         // ---------- 第二遍：数据驱动的"发布者是否创作者" ----------
         ApplyProxyHeuristic(bars);
+
+        // 时段网格 / 人工棒号模式：棒号只当「标签」，缺失位置由时间（槽位）决定 ——
+        // 这时不能拿棒号做数字连续性断言，否则人工指定的棒号会反推出根本不存在的缺口。
+        var timeDrivenBars = result.SlotGridNote is not null || manualBarsApplied > 0;
 
         // ---------- 断言 2：棒号完整性（上限 = 实际最高棒号） ----------
         var numbered = bars.Where(b => b.BarNumber.HasValue).ToList();
         var dups = numbered.GroupBy(b => b.BarNumber!.Value).Where(g => g.Count() > 1)
                            .Select(g => g.Key).OrderBy(x => x).ToList();
         if (dups.Count > 0)
-            result.AssertionFailures.Add($"棒号重复：{string.Join(", ", dups.Select(x => "第" + x + "棒"))}");
+        {
+            var dupText = $"棒号重复：{string.Join(", ", dups.Select(x => "第" + x + "棒"))}";
+            if (timeDrivenBars) result.Warnings.Add(dupText + "（棒号由人工指定/时段网格给出，重复不算硬失败）");
+            else result.AssertionFailures.Add(dupText);
+        }
 
         if (numbered.Count == 0)
         {
-            if (bars.Count > 0) result.AssertionFailures.Add("没有任何卡片解析出棒号");
+            if (bars.Count > 0)
+            {
+                if (timeDrivenBars) result.Warnings.Add("没有任何卡片解析出棒号（缺口位置仍按时间判定）");
+                else result.AssertionFailures.Add("没有任何卡片解析出棒号");
+            }
+        }
+        else if (timeDrivenBars)
+        {
+            // 时段网格 / 人工棒号（--at-bar）：棒号=槽位序号或用户给的标签，不做数字连续性断言。
+            // 缺棒由「时段槽位是否有帖」决定（SlotGrid 已算过）；补录/单链接模式只有已知棒位。
+            result.Warnings.Add(missingBarsOnlyWithinKnownRange
+                ? "棒号不做数字连续性断言：只覆盖已知棒位，缺口位置一律按时间判定"
+                : "棒号不做数字连续性断言：缺口位置一律按时间判定（时段槽位/发布时间）");
         }
         else
         {
@@ -170,6 +201,18 @@ public static class ArtifactValidator
 
             if (missingBarsOnlyWithinKnownRange)
                 result.Warnings.Add($"单链接模式：只覆盖第 {min}–{max} 棒，两端之外的棒次未被采集，不计为缺失");
+        }
+
+        // 人工棒号在时段网格上的落点自检：棒号与槽位对不上时只提示，不推翻用户指定。
+        if (manualBarsApplied > 0 && result.SlotGridNote is not null)
+        {
+            var plan = SlotGrid.Infer(bars, tag);
+            foreach (var b in bars)
+            {
+                if (b.BarNumber is null || b.Notes.All(n => !n.StartsWith(BarManualNote, StringComparison.Ordinal))) continue;
+                if (SlotGrid.SlotOf(b, plan) is { } s && s.BarNumber != b.BarNumber)
+                    b.Notes.Add($"人工棒号第{b.BarNumber}棒与时段槽位第{s.BarNumber}棒（{s.Time}）不一致，已按人工指定输出");
+            }
         }
 
         // ---------- 与接口声称的动态数对照（信息性，不硬失败） ----------
@@ -405,6 +448,40 @@ public static class ArtifactValidator
         var parts = hhmm.Split(':');
         if (parts.Length != 2) return int.MaxValue;
         return (int.TryParse(parts[0], out var h) ? h : 0) * 60 + (int.TryParse(parts[1], out var m) ? m : 0);
+    }
+
+    /// <summary>
+    /// 人工指定棒号（`--at-bar N --add-link URL` 的补录场景）：
+    /// 用户给的棒号**优先于任何自动识别**；但这里只改「棒号标签」，
+    /// 缺口/缺失位置仍由时间（时段槽位、发布时间）判定 —— 用户明确要求过这一点。
+    /// 返回实际应用的条数。
+    /// </summary>
+    private static int ApplyManualBars(
+        List<ParsedBar> bars,
+        IReadOnlyDictionary<string, int>? manualBars,
+        ValidationResult result)
+    {
+        if (manualBars is not { Count: > 0 }) return 0;
+
+        var applied = 0;
+        foreach (var b in bars)
+        {
+            if (b.CardId is null || !manualBars.TryGetValue(b.CardId, out var manual)) continue;
+
+            b.BarNumber = manual;
+            b.IsEx = false;
+            b.MatchedStyle = "人工指定";
+            b.Notes.RemoveAll(n => n.StartsWith("棒号推算：", StringComparison.Ordinal));
+            b.Notes.Add(BarManualNote + $"：{manual}（--at-bar，以用户为准；缺口位置仍按时间判定）");
+            applied++;
+        }
+
+        if (applied == 0)
+            result.Warnings.Add($"--at-bar 指定的 {manualBars.Count} 个棒号没有匹配上任何卡片（CardId 对不上）");
+        else
+            result.Warnings.Add($"有 {applied} 条卡片的棒号由人工指定（--at-bar）；只作棒号权威，不用来判断缺口位置");
+
+        return applied;
     }
 
     /// <summary>

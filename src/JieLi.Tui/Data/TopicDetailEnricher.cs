@@ -56,7 +56,20 @@ public static class TopicDetailEnricher
         using var http = new ChainHttp();
         var reader = new ChainPostReader(http);
 
-        using var w = new StreamWriter(postsPath, false, new UTF8Encoding(false));
+        // 上一次被中途打断（Ctrl+C / 管道提前关闭）时可能还有同类进程占着这个文件；
+        // 直接 new StreamWriter 会抛 IOException，栈里看不出是「谁」占的，这里换成可读的提示。
+        StreamWriter posts;
+        try
+        {
+            posts = new StreamWriter(postsPath, false, new UTF8Encoding(false));
+        }
+        catch (IOException ex)
+        {
+            throw new InvalidOperationException(
+                $"写不了 {postsPath}：文件被另一个进程占用。请检查是否还有另一个 jieli 在跑，关掉后重试。", ex);
+        }
+
+        using var w = posts;
         var index = 0;
         foreach (var card in cards.OrderBy(c => c.PubTs))
         {
@@ -128,6 +141,108 @@ public static class TopicDetailEnricher
                     + $"（正文+评论共 {report.TotalChars:N0} 字）");
         log?.Invoke($"已写入 {postsPath}");
         return report;
+    }
+
+    /// <summary>
+    /// 人工补录一帖到话题 work 目录（`--add-link URL --into &lt;topic_id&gt;`）：
+    /// 读详情 → 追加进 cards.jsonl（若这张卡还不存在）与 posts.jsonl（正文/评论），
+    /// 之后 `--parse` 就把它当成本来就在话题里的一棒。
+    ///
+    /// 这样补录与「话题采集」走同一条解析/校验路径，产出的 CSV/md 与 TUI 清单完全同构。
+    /// </summary>
+    public static PostFacts AppendManual(
+        string workRoot,
+        long topicId,
+        PostRef reference,
+        Action<string>? log,
+        CancellationToken ct = default)
+    {
+        var dir = Path.Combine(workRoot, topicId.ToString());
+        var cardsPath = Path.Combine(dir, "cards.jsonl");
+        var postsPath = Path.Combine(dir, "posts.jsonl");
+        if (!File.Exists(cardsPath))
+            throw new FileNotFoundException($"找不到已采集的数据：{cardsPath}。请先执行 --collect {topicId}。", cardsPath);
+
+        using var http = new ChainHttp();
+        var reader = new ChainPostReader(http);
+        var facts = reader.Read(reference, m => log?.Invoke("  " + m), ct);
+        var cardId = string.IsNullOrWhiteSpace(facts.PostId) ? reference.Id : facts.PostId;
+
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var line in File.ReadLines(cardsPath))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                if (doc.RootElement.TryGetProperty("id", out var idEl) && idEl.GetString() is { Length: > 0 } id)
+                    known.Add(id);
+            }
+            catch (JsonException) { /* 坏行跳过：不该因为一行坏数据挡住补录 */ }
+        }
+
+        if (known.Contains(cardId))
+        {
+            log?.Invoke($"  · {cardId} 已经在 cards.jsonl 里，只更新它的详情");
+        }
+        else
+        {
+            var typeText = facts.Kind switch
+            {
+                PostKind.Video => "video",
+                PostKind.Topic => "topic",
+                _ => "opus",
+            };
+            var cardLine = JsonSerializer.Serialize(new
+            {
+                id = cardId,
+                type = typeText,
+                author_mid = facts.AuthorUid,
+                author_name = facts.AuthorName,
+                pub_ts = facts.PubTs,
+                pub_time = facts.PubLocal == DateTime.MinValue ? null : facts.PubLocal.ToString("yyyy-MM-dd HH:mm"),
+                text_sources = new Dictionary<string, string>(),
+                merged_text = string.Empty,
+                manual = true,   // 人工补录标记（复核时一眼能看出这一条不是话题里的卡）
+            }, JsonlOut);
+            File.AppendAllText(cardsPath, cardLine + Environment.NewLine, new UTF8Encoding(false));
+            log?.Invoke($"  + 已把 {cardId}（{facts.AuthorName}）补进 cards.jsonl");
+        }
+
+        var body = facts.BodyText?.Trim() ?? string.Empty;
+        var comments = facts.CommentsText?.Trim() ?? string.Empty;
+        var postLine = JsonSerializer.Serialize(new
+        {
+            card_id = cardId,
+            kind = facts.Kind.ToString(),
+            url = string.IsNullOrWhiteSpace(facts.Url) ? reference.Url : facts.Url,
+            author_mid = facts.AuthorUid,
+            author_name = facts.AuthorName,
+            pub_ts = facts.PubTs,
+            title = facts.Title,
+            role = facts.WorkKindLabel,
+            comment_count = facts.CommentCount,
+            bar_raw = facts.BarRaw,
+            bar_number = facts.BarNumber,
+            declared_time = facts.DeclaredTime,
+            creator_in_text = facts.CreatorInText,
+            is_proxy = facts.IsProxy,
+            proxy_name = facts.ProxyName,
+            prevs = facts.Prevs.Select(p => new { name = p.Name, uid = p.Uid, bar = p.BarRaw, time = p.DeclaredTime }),
+            nexts = facts.Nexts.Select(p => new { name = p.Name, uid = p.Uid, bar = p.BarRaw, time = p.DeclaredTime }),
+            mentions = facts.Mentions.Select(m => new { name = m.Name, uid = m.Uid }),
+            last_mark_raw = facts.LastMarkRaw,
+            first_mark_raw = facts.FirstMarkRaw,
+            body_text = body,
+            comments_text = comments,
+            body_chars = body.Length,
+            comment_chars = comments.Length,
+            error = (string?)null,
+            warnings = facts.ReaderWarnings,
+        }, JsonlOut);
+        File.AppendAllText(postsPath, postLine + Environment.NewLine, new UTF8Encoding(false));
+        log?.Invoke($"  + 已补进 posts.jsonl（正文 {body.Length} 字，评论 {comments.Length} 字）");
+        return facts;
     }
 
     /// <summary>从原始卡片里读「卡片 → 目标帖子」的映射（视频卡给 bvid、专栏卡给 cv 号）。</summary>

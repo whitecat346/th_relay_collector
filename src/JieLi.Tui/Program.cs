@@ -54,6 +54,11 @@ public static class Program
         Chain.PostKind? forcedKind = null;
         // 话题采集默认逐帖补全详情（话题卡面只有首行摘要）；--no-details 可关掉（离线/求快时用）
         bool fetchDetails = true;
+        // 补录：--add-link 要落到哪个已有接力上（work/<slug> 或话题 id）
+        string? intoArg = null;
+        // 按届过滤（同一个话题被年度接力反复复用）：--year 选年份，--all-years 关闭过滤
+        int? yearArg = null;
+        bool allYears = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -164,6 +169,15 @@ public static class Program
                 case "--add-link":
                     if (i + 1 < args.Length) addLinks.Add((args[++i], null));
                     break;
+                case "--into":
+                    if (i + 1 < args.Length) intoArg = args[++i];
+                    break;
+                case "--year":
+                    if (i + 1 < args.Length && int.TryParse(args[++i], out var yearValue)) yearArg = yearValue;
+                    break;
+                case "--all-years":
+                    allYears = true;
+                    break;
                 case "--at-bar":
                     if (i + 1 < args.Length && addLinks.Count > 0 && int.TryParse(args[++i], out var forcedBar))
                     {
@@ -218,12 +232,23 @@ public static class Program
         if (probeUser is not null) return RunProbeUser(probeWorkRoot, probeUser);
         if (probeSpaceUid is not null) return RunProbeSpace(probeWorkRoot, probeSpaceUid.Value, relayArg);
 
+        // 补录（--add-link + --into）：往**已有的**接力里补一棒，并自动把缺的部分补齐
+        if (addLinks.Count > 0 && intoArg is not null)
+            return RunAddLink(root, outDir, intoArg, addLinks, dateArg, hoursArg, asArg, fetchDetails);
+        if (addLinks.Count > 0 && linkTarget is null)
+        {
+            Console.Error.WriteLine("--add-link 需要用 --into <slug|topic_id> 指定要补进哪一条接力，");
+            Console.Error.WriteLine("  或者用 --link <入口帖> 现场开一条新链（补录链接会先进入链再双向展开）。");
+            return 2;
+        }
+
         // 接力链遍历（用户给一棒，双向自动补全整条链）
         if (linkTarget is not null)
-            return RunLink(root, outDir, linkTarget, addLinks, dateArg, hoursArg, asArg, aiFlag, aiYes, aiBudget, forcedKind, fetchDetails);
+            return RunLink(root, outDir, linkTarget, addLinks, dateArg, hoursArg, asArg, aiFlag, aiYes, aiBudget,
+                           forcedKind, fetchDetails, yearArg, allYears);
 
         if (collectTarget is not null)
-            return RunCollect(root, collectTarget, outDir, fetchDetails);
+            return RunCollect(root, collectTarget, outDir, fetchDetails, yearArg, allYears);
         if (parseTarget is not null)
             return RunParse(root, parseTarget, outDir);
 
@@ -231,7 +256,7 @@ public static class Program
             return RunRoster(root, rosterTarget, outDir);
 
         if (pipelineTarget is not null)
-            return RunPipeline(root, pipelineTarget, outDir, fetchDetails);
+            return RunPipeline(root, pipelineTarget, outDir, fetchDetails, yearArg, allYears);
 
         // 人工确认视图（M4）
         if (reviewTarget is not null)
@@ -286,7 +311,8 @@ public static class Program
 
     // ------------------------------------------------------------- 采集模式
 
-    private static int RunCollect(string root, string target, string? outDir, bool fetchDetails = true)
+    private static int RunCollect(string root, string target, string? outDir, bool fetchDetails = true,
+        int? yearFilter = null, bool allYears = false)
     {
         long? topicId = ParseTopicId(target);
         if (topicId is null)
@@ -307,7 +333,8 @@ public static class Program
         var collector = new TopicCollector(client);
         try
         {
-            var manifest = collector.CollectAsync(topicId.Value, workRoot, Log).GetAwaiter().GetResult();
+            var manifest = collector.CollectAsync(topicId.Value, workRoot, Log,
+                CancellationToken.None, yearFilter, null, allYears).GetAwaiter().GetResult();
             Log("");
             if (fetchDetails)
             {
@@ -345,6 +372,207 @@ public static class Program
             if (ex.InnerException is not null) Log("  内层：" + ex.InnerException.Message);
             return 4;
         }
+    }
+
+    // ------------------------------------------------------------- 补录（--add-link --into）
+
+    /// <summary>
+    /// `--add-link &lt;URL&gt; [--at-bar N] --into &lt;slug|topic_id&gt;`：往**已有**的接力里补一棒，
+    /// 然后自动把缺的部分补齐（用户要求：补录不应停在「加一条」，而要接着补全）。
+    ///
+    /// - `--into &lt;topic_id&gt;`：把这一帖追加进话题 work 目录（cards.jsonl + posts.jsonl），
+    ///   再重新解析整场；人工棒号交给 `--at-bar`。
+    /// - `--into &lt;slug&gt;`：读 chain.json，把补录帖当新落点双向续走，碰到已知节点即停，
+    ///   再用话题时间表补断点。
+    ///
+    /// **缺口位置一律按时间判定**：`--at-bar` 只改棒号标签，不用来推断缺口在哪。
+    /// </summary>
+    private static int RunAddLink(
+        string root,
+        string? outDir,
+        string into,
+        List<(string Url, int? Bar)> addLinks,
+        string? dateArg,
+        int hoursArg,
+        string? asArg,
+        bool fetchDetails)
+    {
+        var workRoot = outDir ?? Path.Combine(root, "relay-tool", "work");
+        using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        void Log(string m) => w.WriteLine(m);
+
+        if (addLinks.Count == 0)
+        {
+            Log("--into 需要配 --add-link <帖子链接>（可重复）。");
+            return 2;
+        }
+
+        // 目标识别：先当话题 work 目录（work/<topic_id>/cards.jsonl），再当链 work 目录（work/<slug>/chain.json）
+        long? topicId = ParseTopicId(into);
+        if (topicId is not null && File.Exists(Path.Combine(workRoot, topicId.Value.ToString(), "cards.jsonl")))
+            return RunAddLinkTopic(root, workRoot, topicId.Value, addLinks, Log);
+
+        var slug = into.Trim();
+        if (File.Exists(JieLi.Tui.Tui.ChainView.PathFor(workRoot, slug)))
+            return RunAddLinkChain(root, workRoot, slug, addLinks, dateArg, hoursArg, asArg, Log);
+
+        Log($"--into「{into}」没找到可补录的接力：");
+        Log($"  话题模式需要 {Path.Combine(workRoot, into, "cards.jsonl")}");
+        Log($"  链模式需要   {JieLi.Tui.Tui.ChainView.PathFor(workRoot, slug)}");
+        Log("  （先跑 --link 或 --pipeline 生成 work 目录，再用 --into 补录）");
+        return 2;
+    }
+
+    /// <summary>补录进话题 work：追加卡片 + 详情，然后按「话题原有 + 人工补录」重新解析。</summary>
+    private static int RunAddLinkTopic(
+        string root, string workRoot, long topicId, List<(string Url, int? Bar)> addLinks, Action<string> log)
+    {
+        var dir = Path.Combine(workRoot, topicId.ToString());
+        log($"补录到话题 work：{dir}　（{addLinks.Count} 条）");
+        log("");
+
+        var manualBars = new Dictionary<string, int>(StringComparer.Ordinal);
+        var failures = 0;
+        foreach (var (url, forcedBar) in addLinks)
+        {
+            var reference = Chain.LinkResolver.Resolve(url, out var why);
+            if (reference is null)
+            {
+                log($"✗ 「{url}」认不出来：{why ?? "未知原因"}");
+                failures++;
+                continue;
+            }
+
+            log($"补录：{url}");
+            log($"  识别为 {reference.Kind} {reference.Id}"
+                + (forcedBar is null ? "（未指定棒号，按时间/正文推断）" : $"（人工指定第 {forcedBar} 棒）"));
+            try
+            {
+                var facts = TopicDetailEnricher.AppendManual(workRoot, topicId, reference, m => log("  " + m));
+                if (forcedBar is not null) manualBars[facts.PostId] = forcedBar.Value;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log($"  ✗ 读取失败：{ex.GetType().Name}: {ex.Message}");
+                log($"  这条可以稍后重试：--add-link {url} --into {topicId}"
+                    + (forcedBar is null ? "" : $" --at-bar {forcedBar}"));
+                failures++;
+            }
+        }
+
+        if (manualBars.Count > 0)
+        {
+            log("");
+            log("人工棒号（以你为准，只作棒号标签；缺口位置仍按时间判定）：");
+            foreach (var kv in manualBars) log($"  · {kv.Key} → 第 {kv.Value} 棒");
+        }
+
+        log("");
+        log("补录完成，重新解析整场（卡片 = 话题原有 + 人工补录）：");
+        log("");
+        var parseExit = RunParse(root, topicId.ToString(), workRoot, manualBars);
+        return failures == 0 ? parseExit : Math.Max(parseExit, 1);
+    }
+
+    /// <summary>补录进链 work：读 chain.json，从补录帖双向续走，再覆盖写回。</summary>
+    private static int RunAddLinkChain(
+        string root, string workRoot, string slug, List<(string Url, int? Bar)> addLinks,
+        string? dateArg, int hoursArg, string? asArg, Action<string> log)
+    {
+        var view = JieLi.Tui.Tui.ChainView.TryLoad(workRoot, slug, out var loadError);
+        if (view?.Result is null)
+        {
+            log("读取 chain.json 失败：" + (loadError ?? "未知原因"));
+            return 2;
+        }
+
+        var existing = view.Result;
+        log($"补录到链：{slug}");
+        log($"  已有节点 {existing.Nodes.Count} 个，缺口 {existing.Gaps.Count} 处，活动名 {existing.RelayName ?? "未识别"}");
+        log("");
+
+        var supplements = new List<(Chain.PostRef Ref, int? ForcedBar)>();
+        foreach (var (url, forcedBar) in addLinks)
+        {
+            var r = Chain.LinkResolver.Resolve(url, out var why);
+            if (r is null)
+            {
+                log($"✗ 「{url}」认不出来：{why ?? "未知原因"}");
+                return 2;
+            }
+            log($"补录：{r.Url}（{r.Kind} {r.Id}）"
+                + (forcedBar is null ? "（未指定棒号）" : $"→ 第 {forcedBar} 棒（人工指定，只作棒号权威）"));
+            supplements.Add((r, forcedBar));
+        }
+        log("");
+
+        var startFacts = existing.Nodes.FirstOrDefault(n => n.IsStart)?.Facts;
+        var dayStart = startFacts?.PubLocal.Date ?? DateTime.MinValue;
+        var query = new Chain.RelayQuery
+        {
+            RelayName = existing.RelayName,
+            TopicId = FirstTopicIdOf(existing),
+            DayStart = dayStart,
+            DayEnd = dayStart == DateTime.MinValue
+                ? DateTime.MinValue
+                : dayStart.AddHours(hoursArg > 0 ? hoursArg : 24),
+            DeclaredHours = hoursArg,
+        };
+
+        using var http = new Chain.ChainHttp();
+        var cache = new Chain.UserCache(Path.Combine(workRoot, "users.json"));
+        cache.Load(log);
+        var reader = new Chain.ChainPostReader(http);
+        var locator = new Chain.ChainUserLocator(http, new Chain.ChainSearchClient(http), cache);
+        var walker = new Chain.ChainWalker(http, reader, locator) { MaxNodes = 80, MaxConsecutiveFailures = 2 };
+
+        Chain.ChainResult completed;
+        try
+        {
+            completed = walker.Complete(existing, supplements, query, m => log("  " + m));
+        }
+        catch (Chain.ChainFetchException ex)
+        {
+            log("补录中止：" + ex.Message);
+            return 3;
+        }
+        catch (Exception ex)
+        {
+            log($"补录异常：{ex.GetType().Name}: {ex.Message}");
+            if (ex.InnerException is not null) log("  内层：" + ex.InnerException.Message);
+            return 4;
+        }
+
+        log("");
+        log($"补录后：节点 {completed.Nodes.Count} 个（原 {existing.Nodes.Count}），缺口 {completed.Gaps.Count} 处（原 {existing.Gaps.Count}）");
+        foreach (var gap in completed.Gaps)
+            log($"  ⚠ {gap.ExpectedName ?? gap.Kind}：{gap.Reason}　→ {gap.SuggestedCommand}");
+
+        string dir;
+        try
+        {
+            dir = Chain.ChainWriter.Write(workRoot, existing.Slug ?? slug, completed, query, dateArg, m => log("  " + m));
+        }
+        catch (Exception ex)
+        {
+            log("写回链数据失败：" + ex.Message);
+            return 4;
+        }
+
+        log("");
+        log($"已写回 {dir}");
+        log("提示：review.jsonl 已按新链重新生成，所有条目的确认状态被重置为「未确认」。");
+        log($"下一步：jieli --review {existing.Slug ?? slug}");
+        if (completed.Gaps.Count > 0)
+            log($"仍有 {completed.Gaps.Count} 处缺口：按上面的「可直接复制」命令再补一帖，直到缺口清零。");
+        return 0;
+    }
+
+    private static long? FirstTopicIdOf(Chain.ChainResult result)
+    {
+        foreach (var node in result.Nodes)
+            if (node.Facts?.TopicId is > 0 and var topicId) return topicId;
+        return null;
     }
 
     // ------------------------------------------------------------- 单链接模式
@@ -673,7 +901,8 @@ public static class Program
     /// 这是 M4「半自动辅助器」的入口：非交互入口只产出草稿与待确认清单，
     /// 绝不产出最终 CSV/md（最终写出必须经过 TUI 确认，符合设计阶段定下的防线）。
     /// </summary>
-    private static int RunPipeline(string root, string target, string? outDir, bool fetchDetails = true)
+    private static int RunPipeline(string root, string target, string? outDir, bool fetchDetails = true,
+        int? yearFilter = null, bool allYears = false)
     {
         long? topicId = ParseTopicId(target);
         if (topicId is null) { Console.Error.WriteLine($"无法从「{target}」解析出 topic_id。"); return 2; }
@@ -690,7 +919,7 @@ public static class Program
         try
         {
             manifest = collector.CollectAsync(topicId.Value, workRoot,
-                m => Log("  " + m), CancellationToken.None).GetAwaiter().GetResult();
+                m => Log("  " + m), CancellationToken.None, yearFilter, null, allYears).GetAwaiter().GetResult();
         }
         catch (CollectException ex)
         {
@@ -747,7 +976,8 @@ public static class Program
         return 0;
     }
 
-    private static int RunParse(string root, string target, string? outDir)
+    private static int RunParse(string root, string target, string? outDir,
+        IReadOnlyDictionary<string, int>? manualBars = null)
     {
         long? topicId = ParseTopicId(target);
         if (topicId is null)
@@ -773,7 +1003,7 @@ public static class Program
             return 2;
         }
 
-        var result = ArtifactValidator.Validate(cards, manifest?.DynamicsReported, manifest?.Name);
+        var result = ArtifactValidator.Validate(cards, manifest?.DynamicsReported, manifest?.Name, manualBars);
 
         Log($"解析话题 topic_id={topicId}  卡片 {cards.Count} 条（离线，来源于 cards.jsonl）");
         Log("");
@@ -996,7 +1226,9 @@ public static class Program
         bool aiYes,
         int aiBudget,
         Chain.PostKind? forcedKind = null,
-        bool fetchDetails = true)
+        bool fetchDetails = true,
+        int? yearFilter = null,
+        bool allYears = false)
     {
         using var w = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
         void Log(string m) => w.WriteLine(m);
@@ -1017,11 +1249,11 @@ public static class Program
             Log($"入口是「话题」（topic_id={start.Id}）—— 话题本身就是整场接力的全集，不需要链遍历。");
             Log("改走话题流程：采集 → 解析与交叉校验 → 写 review.jsonl。");
             if (addLinks.Count > 0)
-                Log("提示：话题入口不需要 --add-link（话题卡片已经覆盖全部帖子），这些补充链接被忽略。");
+                Log("提示：话题入口不需要 --add-link（话题卡片已经覆盖全部帖子）；要补一帖请用 --add-link URL --into <topic_id>。");
             if (dateArg is not null || hoursArg > 0)
                 Log("提示：话题入口不需要 --date/--hours（活动日由卡片发布时间推断），这些参数被忽略。");
             Log("");
-            return RunPipeline(root, start.Id.ToString(), outDir, fetchDetails);
+            return RunPipeline(root, start.Id.ToString(), outDir, fetchDetails, yearFilter, allYears);
         }
 
         var supplements = new List<(Chain.PostRef Ref, int? ForcedBar)>();
@@ -1355,6 +1587,11 @@ public static class Program
         Console.WriteLine("  jieli --link <话题链接>                入口也可以是话题：接力本来就建了话题时，直接走话题流程");
         Console.WriteLine("                                         （话题里没有「第N棒」时按「时段 = 棒位」推算棒号）");
         Console.WriteLine("  jieli --add-link <帖子链接> [--at-bar N]  人工补录一棒（可多次；--at-bar 强制棒号）");
+        Console.WriteLine("  jieli --add-link <帖子链接> --into <slug|topic_id> [--at-bar N]");
+        Console.WriteLine("                                         往**已有的**接力里补一棒，并自动把缺的部分补齐");
+        Console.WriteLine("                                         slug=链模式（从补录帖双向续走）；topic_id=话题模式（重新解析）");
+        Console.WriteLine("  --at-bar <N>                           人工棒号：只作棒号权威，缺口位置一律按时间判定");
+        Console.WriteLine("  --year <2025> / --all-years            话题被多届复用时按届过滤（默认只留含今年的那一届）");
         Console.WriteLine("  --date <2026-09-06|9-6>                活动日期；只给月日时年份取入口帖的年份");
         Console.WriteLine("  --hours <N>                            活动声明时长（24h/32h…），用于放宽搜索区间");
         Console.WriteLine("  --as <活动目录名>                      覆盖自动命名（默认 {年份}_{活动名}_{月-日}）");

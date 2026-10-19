@@ -63,6 +63,9 @@ public static class ChainSelfTest
         state.Case("P AM/PM 换算：10:08 PM @交联纤维素 → 22:08", CaseMeridiemTime);
         state.Case("Q 年份闸门：同话题往年（差 365 天）的帖子即使结构+声明时段齐全也拒收", CaseOffYearRejected);
         state.Case("R 时段网格：整点/半小时成格、重复投稿只占一格、前一天的预告贴不进格", CaseSlotGrid);
+        state.Case("S 按届过滤：同一话题被复用四届时，只留含今年的那一届（--year/--date 可选届）", CaseTopicYearFilter);
+        state.Case("T 人工棒号（--at-bar）：只作棒号权威，缺口位置仍按时间判定", CaseManualBarOnlyLabel);
+        state.Case("U 补录补全（--add-link --into）：已知节点零网络重放，补录帖续走并补掉缺口", CaseAddLinkCompletes);
 
         state.Line($"  遍历器与落盘用例：通过 {state.Passed}，失败 {state.Failed}");
         return new ChainSelfTestResult { Passed = state.Passed, Failed = state.Failed };
@@ -596,6 +599,110 @@ public static class ChainSelfTest
             $"Ignored={result.Ignored.Count}，IsDuplicate={bars.Count(b => b.IsDuplicate)}");
         s.Check("不在活动日的预告贴不赋棒号", bars[5].BarNumber is null,
             bars[5].BarNumber?.ToString() ?? "null");
+    }
+
+    /// <summary>
+    /// 按届过滤：同一个话题常被年度接力反复复用（实测 topic 1101507 跨 2023–2026 四届，88 条）。
+    /// 规则：按发布时间排序、相邻间隔 &gt;45 天切届，只留「含今年」的那一届。
+    /// </summary>
+    private static void CaseTopicYearFilter(RunState s)
+    {
+        var cards = new List<TopicCard>();
+        void Add(string id, DateTime day) =>
+            cards.Add(new TopicCard { Id = id, AuthorName = "作者" + id, PubTs = ToUnix(day) });
+
+        for (var i = 0; i < 24; i++) Add("26_" + i, new DateTime(2026, 10, 1).AddHours(i));
+        for (var i = 0; i < 16; i++) Add("25_" + i, new DateTime(2025, 10, 1).AddHours(i));
+        for (var i = 0; i < 18; i++) Add("24_" + i, new DateTime(2024, 10, 1).AddHours(i));
+        for (var i = 0; i < 30; i++) Add("23_" + i, new DateTime(2023, 10, 1).AddHours(i));
+
+        var sel = TopicYearFilter.Select(cards, currentYear: 2026);
+        s.Check("按届过滤：只留含今年的那一届（2026，24 条）", sel.Kept.Count == 24 && sel.Year == 2026, sel.Note);
+        s.Check("排除其它三届（16+18+30=64 条）", sel.Dropped.Count == 64 && sel.DroppedEditions.Count == 3, sel.Note);
+        s.Check("说明里写明保留届的起止日期", sel.Note.Contains("2026-10-01", StringComparison.Ordinal), sel.Note);
+
+        var old = TopicYearFilter.Select(cards, yearOverride: 2024, currentYear: 2026);
+        s.Check("--year 2024 能挑出 2024 那一届", old.Year == 2024 && old.Kept.Count == 18, old.Note);
+
+        var byDate = TopicYearFilter.Select(cards, dateOverride: new DateTime(2025, 10, 1, 5, 0, 0), currentYear: 2026);
+        s.Check("--date 2025-10-01 按日期选届", byDate.Year == 2025 && byDate.Kept.Count == 16, byDate.Note);
+    }
+
+    /// <summary>
+    /// `--at-bar`：用户给的棒号只作标签（权威），**缺口位置仍按时间判定** ——
+    /// 不能因为棒号从 1,2 跳到 9 就报「缺棒 3..8」。
+    /// </summary>
+    private static void CaseManualBarOnlyLabel(RunState s)
+    {
+        var day = new DateTime(2026, 10, 8);
+        var bars = new List<ParsedBar>
+        {
+            Bar("a", "作者A", day.AddHours(0)),
+            Bar("b", "作者B", day.AddHours(1)),
+            Bar("c", "作者C", day.AddHours(2)),
+        };
+        var manual = new Dictionary<string, int>(StringComparer.Ordinal) { ["c"] = 9 };
+
+        var result = ArtifactValidator.ValidateFromBars(bars, null, null, manual);
+        var c = bars.First(x => x.CardId == "c");
+
+        s.Check("人工棒号生效（第 9 棒）", c.BarNumber == 9, c.BarNumber?.ToString() ?? "null");
+        s.Check("人工棒号带规定的 note 前缀",
+            c.Notes.Any(n => n.StartsWith(ArtifactValidator.BarManualNote, StringComparison.Ordinal)),
+            string.Join("；", c.Notes));
+        s.Check("不因棒号跳号而断言失败（缺口按时间判定）", result.AssertionFailures.Count == 0,
+            string.Join("；", result.AssertionFailures));
+        s.Check("给出「缺口位置按时间」的警告",
+            result.Warnings.Any(w => w.Contains("缺口位置", StringComparison.Ordinal)),
+            string.Join("；", result.Warnings));
+    }
+
+    /// <summary>
+    /// `--add-link --into &lt;slug&gt;` 的补全语义：已知节点零网络种回，补录帖当新落点续走，
+    /// 碰到已知节点即停，缺口减少、目录名不变。
+    /// </summary>
+    private static void CaseAddLinkCompletes(RunState s)
+    {
+        var reader = new FakeReader();
+        var locator = new FakeLocator();
+
+        var p1 = Facts("2001", "作者A", 2001, BaseDay.AddHours(20), bar: 1, declared: "20:00", first: true);
+        p1.Nexts.Add(Link("作者B", isPrev: false, uid: "2002", declaredTime: "21:00"));
+
+        var p2 = Facts("2002", "作者B", 2002, BaseDay.AddHours(21), bar: 2, declared: "21:00");
+        p2.Prevs.Add(Link("作者A", isPrev: true, uid: "2001", declaredTime: "20:00"));
+        p2.Nexts.Add(Link("作者C", isPrev: false, uid: "2003", declaredTime: "22:00"));
+
+        var p3 = Facts("2003", "作者C", 2003, BaseDay.AddHours(22), bar: 3, declared: "22:00");
+        p3.Prevs.Add(Link("作者B", isPrev: true, uid: "2002", declaredTime: "21:00"));
+        p3.LastMark = true;
+        p3.LastMarkRaw = "最后一棒";
+
+        // 第一次遍历时作者C 还搜不到 → 留下一个缺口
+        Register(reader, locator, p1);
+        Register(reader, locator, p2);
+        var first = Walk(reader, locator, PostRef.Opus("2001"), Query());
+        s.Check("补录前：2 个节点、1 处缺口",
+            first.Nodes.Count == 2 && first.Gaps.Count == 1,
+            $"节点 {first.Nodes.Count}，缺口 {first.Gaps.Count}");
+
+        Register(reader, locator, p3);
+        reader.ReadLog.Clear();
+
+        using var http = new ChainHttp();
+        var walker = new ChainWalker(http, reader, locator) { MaxNodes = 40, MaxConsecutiveFailures = 2 };
+        var completed = walker.Complete(first, new[] { (PostRef.Opus("2003"), (int?)3) }, Query(), log: null);
+
+        s.Check("已知节点不重读（补录不重放整条链）",
+            !reader.ReadLog.Contains("2001") && !reader.ReadLog.Contains("2002"),
+            string.Join(",", reader.ReadLog));
+        s.Check("补录后节点数=3", completed.Nodes.Count == 3,
+            string.Join(",", completed.Nodes.Select(n => n.Ref.Id)));
+        s.Check("补录后缺口归零", completed.Gaps.Count == 0, DescribeGaps(completed));
+        s.Check("补录帖标记为补充落点",
+            completed.Nodes.Any(n => n.IsSupplement && n.Ref.Id == "2003"),
+            string.Join(",", completed.Nodes.Select(n => $"{n.Ref.Id}:{n.IsSupplement}")));
+        s.Check("目录名（slug）沿用原链", completed.Slug == first.Slug, $"{first.Slug} → {completed.Slug}");
     }
 
     /// <summary>造一条 ParsedBar：CardId、发布者、本地发布时刻（可选声明时段）。</summary>

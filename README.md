@@ -30,7 +30,13 @@ jieli --link "<任意一棒的链接>"            # 链遍历：没建话题的�
                                           #   产出 work/<slug>/{chain.json,review.jsonl,report.md}
 jieli --link "<话题链接>"                  # 建了话题的接力：改走话题流程（话题已含全场帖子）
                                           #   正文只写「17:00 @某人」时按「时段 = 棒位」推算棒号
-jieli --link "<链接>" --add-link "<链接>"  # 补录缺口（可多次；--at-bar N 人工指定棒号）
+jieli --link "<链接>" --add-link "<链接>"  # 同一次运行里补落点（可多次；--at-bar N 人工指定棒号）
+jieli --add-link "<链接>" --into <slug|topic_id> [--at-bar N]
+                                          # 往**已有**的接力里补一棒，并自动把缺的部分补齐
+                                          #   slug=链模式（旧节点零网络种回后双向续走）
+                                          #   topic_id=话题模式（追加到 cards/posts 后重新解析）
+jieli --pipeline <id> [--year 2024|--date 2024-09-17|--all-years]
+                                          # 话题被多届复用时按届过滤（默认只留含今年的一届）
 jieli --link "<链接>" --date 2025-08-15 --hours 32 --as <目录名>
 jieli --link "<链接>" --ai [--ai-yes] [--ai-budget 20]   # AI 辅助（默认关，需 ai.yml）
 jieli --review   <topic_id|slug>           # TUI 人工确认（唯一合法确认入口；A/G/C 见手册）
@@ -72,6 +78,20 @@ jieli                                     # 只读审阅已有归档（22 个目
 
 **话题卡面不等于正文**：卡片接口只给首行摘要，所以采集后会**逐帖进详情页**（opus / 视频 / 专栏）
 连同评论区一起抓，落到 `work/<topic_id>/posts.jsonl` 再并回解析。不想抓就加 `--no-details`。
+
+## 补录一棒（`--add-link --into`）与按届过滤（`--year`）
+
+链遍历/话题采集总会漏掉几棒（对面没写 `@`、搜索被风控、帖子真的没标）。补的时候指定**补进哪一条接力**：
+
+- `--into <slug>`：读 `work/<slug>/chain.json`，旧节点**零网络**种回后从补录帖双向续走，碰到已知节点即停，
+  再用话题时间表补断点，覆写 `chain.json`/`review.jsonl`/`report.md`（review 全部重置为未确认）。
+- `--into <topic_id>`：把这一帖追加进 `cards.jsonl` + `posts.jsonl`，重新解析整场。
+- `--at-bar N` 只作**棒号权威**；缺口位置一律按时间判定，棒号不连续不会因此报「缺棒」。
+- 补录链接若指到了别的接力（发布时间不在本场时间窗 −2h～+6h），会给出警告并剔除顺带走进来的帖子。
+
+同一个话题被年度接力反复复用时（实测 `topic 1101507` 横跨 2023–2026 四届），默认按「相邻帖间隔 > 45 天」切届、
+只留含今年的一届；被排除的卡片写 `cards.dropped.jsonl`。要看别的届用 `--year 2024` / `--date 2024-09-17`，
+确认不需要过滤用 `--all-years`。
 
 ## 产物契约
 
